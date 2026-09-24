@@ -64,6 +64,7 @@ function AdminDashboard({ token, onLogout }) {
   const [suggestions, setSuggestions] = useState([])
   const [appointments, setAppointments] = useState([])
   const [isLoading, setIsLoading] = useState(true)
+  const [updatingMedicineId, setUpdatingMedicineId] = useState(null)
   const [message, setMessage] = useState('')
 
   const setMedicineResults = (medicineData) => {
@@ -90,24 +91,16 @@ function AdminDashboard({ token, onLogout }) {
   }
 
   useEffect(() => {
-    getMedicines({ limit: 10 })
-      .then((medicineData) => {
+    Promise.all([getMedicines({ limit: 10 }), getAdminAppointments(token)])
+      .then(([medicineData, appointmentData]) => {
         setMedicineResults(medicineData)
+        setAppointments(appointmentData)
       })
       .catch((error) => {
         if (error.message.includes('session') || error.message.includes('login')) onLogout()
         else setMessage(error.message)
       })
       .finally(() => setIsLoading(false))
-  }, [token, onLogout])
-
-  useEffect(() => {
-    getAdminAppointments(token)
-      .then(setAppointments)
-      .catch((error) => {
-        if (error.message.includes('session') || error.message.includes('login')) onLogout()
-        else setMessage(error.message)
-      })
   }, [token, onLogout])
 
   useEffect(() => {
@@ -166,13 +159,24 @@ function AdminDashboard({ token, onLogout }) {
       return
     }
     try {
+      setUpdatingMedicineId(medicineId)
       const updated = await updateMedicineStock(token, medicineId, { availableQty: quantity, singlePiecePrice, fullBoxPrice })
       setMedicines((current) => current.map((medicine) => medicine.id === updated.id ? updated : medicine))
+      setStockDrafts((current) => ({
+        ...current,
+        [medicineId]: {
+          availableQty: String(updated.availableQty),
+          singlePiecePrice: String(updated.singlePiecePrice ?? 0),
+          fullBoxPrice: String(updated.fullBoxPrice ?? 0),
+        },
+      }))
       setMessage(updated.pricesSaved === false
         ? 'Stock quantity updated. Run the Supabase price-column migration to save prices.'
         : 'Stock and prices updated successfully.')
     } catch (error) {
       setMessage(error.message)
+    } finally {
+      setUpdatingMedicineId(null)
     }
   }
 
@@ -234,7 +238,7 @@ function AdminDashboard({ token, onLogout }) {
             <div className="mt-5 max-h-[62vh] overflow-y-auto pr-2">
               <div className="grid gap-3">
               {medicines.length === 0 && <p className="rounded-xl bg-[#f4f9fc] p-4 text-[#607487] dark:bg-slate-800">No medicines found.</p>}
-              {medicines.map((medicine) => { const draft = stockDrafts[medicine.id] || {}; return <div key={medicine.id} className="grid grid-cols-[1fr_110px_130px_130px_auto] items-end gap-3 rounded-2xl bg-[#f4f9fc] p-3 dark:bg-slate-800 max-sm:grid-cols-1"><div><strong className="block">{medicine.brandName}</strong><span className="text-sm text-[#607487]">{medicine.genericName} · {medicine.manufacturer}</span></div><label className="text-xs font-bold text-[#607487]">Units<input className="mt-1 w-full rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-[#172b3d]" type="number" min="0" value={draft.availableQty ?? ''} onChange={(event) => updateDraft(medicine.id, 'availableQty', event.target.value)} /></label><label className="text-xs font-bold text-[#607487]">Piece price<input className="mt-1 w-full rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-[#172b3d]" type="number" min="0" step="0.01" value={draft.singlePiecePrice ?? ''} onChange={(event) => updateDraft(medicine.id, 'singlePiecePrice', event.target.value)} /></label><label className="text-xs font-bold text-[#607487]">Box price<input className="mt-1 w-full rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-[#172b3d]" type="number" min="0" step="0.01" value={draft.fullBoxPrice ?? ''} onChange={(event) => updateDraft(medicine.id, 'fullBoxPrice', event.target.value)} /></label><button type="button" onClick={() => changeStock(medicine.id)} className="rounded-lg bg-[#2f80c0] px-3 py-2 text-sm font-bold text-white hover:bg-[#18527f]">Update</button></div> })}
+              {medicines.map((medicine) => { const draft = stockDrafts[medicine.id] || {}; const isUpdating = updatingMedicineId === medicine.id; return <div key={medicine.id} className="grid grid-cols-[1fr_110px_130px_130px_auto] items-end gap-3 rounded-2xl bg-[#f4f9fc] p-3 dark:bg-slate-800 max-sm:grid-cols-1"><div><strong className="block">{medicine.brandName}</strong><span className="text-sm text-[#607487]">{medicine.genericName} · {medicine.manufacturer}</span></div><label className="text-xs font-bold text-[#607487]">Units<input className="mt-1 w-full rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-[#172b3d]" type="number" min="0" value={draft.availableQty ?? ''} onChange={(event) => updateDraft(medicine.id, 'availableQty', event.target.value)} /></label><label className="text-xs font-bold text-[#607487]">Piece price<input className="mt-1 w-full rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-[#172b3d]" type="number" min="0" step="0.01" value={draft.singlePiecePrice ?? ''} onChange={(event) => updateDraft(medicine.id, 'singlePiecePrice', event.target.value)} /></label><label className="text-xs font-bold text-[#607487]">Box price<input className="mt-1 w-full rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-[#172b3d]" type="number" min="0" step="0.01" value={draft.fullBoxPrice ?? ''} onChange={(event) => updateDraft(medicine.id, 'fullBoxPrice', event.target.value)} /></label><button type="button" disabled={isUpdating} onClick={() => changeStock(medicine.id)} className="rounded-lg bg-[#2f80c0] px-3 py-2 text-sm font-bold text-white hover:bg-[#18527f] disabled:cursor-wait disabled:opacity-60">{isUpdating ? 'Saving...' : 'Update'}</button></div> })}
               </div>
             </div>
           </div>

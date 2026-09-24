@@ -48,7 +48,7 @@ function PublicApp() {
   }, [isDark])
 
   useEffect(() => {
-    getMedicines({ limit: 20, random: true })
+    getMedicines({ limit: 10, random: true })
       .then((medicines) => setInventory(medicines.map((medicine) => ({ ...medicine, category: medicine.category || 'General Care' }))))
       .catch((error) => setCatalogError(error.message))
   }, [])
