@@ -24,14 +24,6 @@ const services = [
   },
 ]
 
-const categories = [
-  'General Care',
-  'Skin & Hair',
-  'Vitamins',
-  'Baby Care',
-  'Diabetes',
-  'Heart Care',
-]
 
 function PublicApp() {
   const [inventory, setInventory] = useState([])
