@@ -87,9 +87,6 @@ function PublicApp() {
         <button type="button" onClick={toggleTheme} className="rounded-xl border border-[#d9e7f0] bg-white px-3 py-2 text-lg shadow-sm transition hover:bg-[#e7f4fc] dark:border-slate-600 dark:bg-slate-800 dark:hover:bg-slate-700" aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}>
           {isDark ? '☀️' : '🌙'}
         </button>
-        <button type="button" className="rounded-xl bg-[#2f80c0] px-4 py-3 font-bold text-white shadow-lg shadow-[#2f80c0]/20 transition hover:bg-[#18527f]">
-          Order Medicines
-        </button>
         </div>
       </header>
 
@@ -105,7 +102,7 @@ function PublicApp() {
 
             <div className="mt-7 flex flex-wrap gap-3">
               <button type="button" className="rounded-xl bg-[#2f80c0] px-6 py-4 font-bold text-white shadow-lg shadow-[#2f80c0]/30 transition hover:bg-[#18527f]">
-                Shop now
+                Buy Now
               </button>
             </div>
 

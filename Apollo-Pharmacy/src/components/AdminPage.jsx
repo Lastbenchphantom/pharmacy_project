@@ -82,23 +82,27 @@ function AdminDashboard({ token, onLogout }) {
   }
 
   const loadDashboard = async () => {
-    const [medicineData, appointmentData] = await Promise.all([
+    const [medicineResult, appointmentResult] = await Promise.allSettled([
       getMedicines({ limit: 10, search: submittedSearch }),
       getAdminAppointments(token),
     ])
-    setMedicineResults(medicineData)
-    setAppointments(appointmentData)
+    if (medicineResult.status === 'fulfilled') setMedicineResults(medicineResult.value)
+    if (appointmentResult.status === 'fulfilled') setAppointments(appointmentResult.value)
+    const failedResult = [medicineResult, appointmentResult].find((result) => result.status === 'rejected')
+    if (failedResult) throw failedResult.reason
   }
 
   useEffect(() => {
-    Promise.all([getMedicines({ limit: 10 }), getAdminAppointments(token)])
-      .then(([medicineData, appointmentData]) => {
-        setMedicineResults(medicineData)
-        setAppointments(appointmentData)
-      })
-      .catch((error) => {
-        if (error.message.includes('session') || error.message.includes('login')) onLogout()
-        else setMessage(error.message)
+    Promise.allSettled([getMedicines({ limit: 10 }), getAdminAppointments(token)])
+      .then(([medicineResult, appointmentResult]) => {
+        if (medicineResult.status === 'fulfilled') setMedicineResults(medicineResult.value)
+        if (appointmentResult.status === 'fulfilled') setAppointments(appointmentResult.value)
+        const failedResult = [medicineResult, appointmentResult].find((result) => result.status === 'rejected')
+        if (failedResult) {
+          const error = failedResult.reason
+          if (error.message.includes('session') || error.message.includes('login')) onLogout()
+          else setMessage(error.message)
+        }
       })
       .finally(() => setIsLoading(false))
   }, [token, onLogout])

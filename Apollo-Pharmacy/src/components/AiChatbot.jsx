@@ -18,7 +18,7 @@ export default function AiChatbot() {
     {
       id: 1,
       sender: 'bot',
-      text: 'Hi! I am Apollo AI. Ask about medicines, wellness, or safe self-care advice.',
+      text: 'Hi! I am Health AI Assistant. Ask about medicines, wellness, or safe self-care advice.',
     },
   ])
   const [input, setInput] = useState('')

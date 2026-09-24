@@ -341,15 +341,28 @@ app.post('/api/appointments', async (req, res, next) => {
 		const hasEmail = columns.some((column) => column.column_name === 'email');
 		const hasNote = columns.some((column) => column.column_name === 'note');
 		const appointmentId = crypto.randomUUID();
-		const appointment = hasEmail && hasNote
-			? (await prisma.$queryRaw(Prisma.sql`
+		let appointment;
+		if (hasEmail && hasNote) {
+			appointment = (await prisma.$queryRaw(Prisma.sql`
 				INSERT INTO "Appointment" ("id", "patientName", "email", "phoneNumber", "doctorName", "timeSlot", "note", "status", "createdAt", "updatedAt")
 				VALUES (${appointmentId}, ${patientName.trim()}, ${email.trim().toLowerCase()}, ${phoneNumber.trim()}, ${doctorName.trim()}, ${timeSlot.trim()}, ${typeof note === 'string' && note.trim() ? note.trim() : null}, 'PENDING', NOW(), NOW()) RETURNING *
-			`))[0]
-			: (await prisma.$queryRaw(Prisma.sql`
+			`))[0];
+		} else if (hasEmail) {
+			appointment = (await prisma.$queryRaw(Prisma.sql`
+				INSERT INTO "Appointment" ("id", "patientName", "email", "phoneNumber", "doctorName", "timeSlot", "status", "createdAt", "updatedAt")
+				VALUES (${appointmentId}, ${patientName.trim()}, ${email.trim().toLowerCase()}, ${phoneNumber.trim()}, ${doctorName.trim()}, ${timeSlot.trim()}, 'PENDING', NOW(), NOW()) RETURNING *
+			`))[0];
+		} else if (hasNote) {
+			appointment = (await prisma.$queryRaw(Prisma.sql`
+				INSERT INTO "Appointment" ("id", "patientName", "phoneNumber", "doctorName", "timeSlot", "note", "status", "createdAt", "updatedAt")
+				VALUES (${appointmentId}, ${patientName.trim()}, ${phoneNumber.trim()}, ${doctorName.trim()}, ${timeSlot.trim()}, ${typeof note === 'string' && note.trim() ? note.trim() : null}, 'PENDING', NOW(), NOW()) RETURNING *
+			`))[0];
+		} else {
+			appointment = (await prisma.$queryRaw(Prisma.sql`
 				INSERT INTO "Appointment" ("id", "patientName", "phoneNumber", "doctorName", "timeSlot", "status", "createdAt", "updatedAt")
 				VALUES (${appointmentId}, ${patientName.trim()}, ${phoneNumber.trim()}, ${doctorName.trim()}, ${timeSlot.trim()}, 'PENDING', NOW(), NOW()) RETURNING *
 			`))[0];
+		}
 
 		res.status(201).json(serializeDatabaseValue(appointment));
 	} catch (error) {
