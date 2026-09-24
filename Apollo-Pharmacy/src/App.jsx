@@ -118,19 +118,6 @@ function PublicApp() {
             </div>
 
           </div>
-
-          <div className="relative z-10 min-h-[420px] max-lg:min-h-[280px]">
-            <div className="mt-10 w-full max-w-[430px] rounded-[28px] border border-[#d9e7f0] bg-white/95 p-6 shadow-2xl shadow-[#18527f]/20 max-lg:mx-auto">
-              <div className="inline-flex rounded-full bg-[#e7f4fc] px-3 py-2 text-xs font-bold text-[#18527f]">Today&apos;s Care Plan</div>
-              <h3 className="my-4 text-3xl font-extrabold text-[#172b3d]">Health essentials for the family</h3>
-              <div className="flex flex-wrap gap-2">
-                {categories.map((item) => (
-                  <span className="rounded-full bg-[#e7f4fc] px-3 py-2 text-xs font-semibold text-[#172b3d]" key={item}>{item}</span>
-                ))}
-              </div>
-            </div>
-
-          </div>
         </section>
 
         <section id="services" className="space-y-5">
