@@ -1,9 +1,10 @@
 const API_URL = (import.meta.env.VITE_API_URL || 'http://localhost:5000/api').replace(/\/$/, '')
 
 async function request(path, options = {}) {
+  const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData
   const response = await fetch(`${API_URL}${path}`, {
     headers: {
-      'Content-Type': 'application/json',
+      ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
       ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}),
       ...options.headers,
     },
@@ -50,4 +51,24 @@ export const updateAppointmentStatus = (token, appointmentId, status) => request
 export const syncMedicines = (token) => request('/admin/medicines/sync', {
   method: 'POST',
   token,
+})
+
+export const uploadStockReceipt = (token, file) => {
+  const body = new FormData()
+  body.append('receipt', file)
+  return request('/stock/receipt/upload', { method: 'POST', token, body })
+}
+
+export const processStockReceipt = (token, receiptId) => request('/stock/receipt/process', {
+  method: 'POST',
+  token,
+  body: JSON.stringify({ receiptId }),
+})
+
+export const getStockReceipt = (token, receiptId) => request(`/stock/receipt/${receiptId}`, { token })
+
+export const confirmStockReceipt = (token, receiptId, items) => request('/stock/receipt/confirm', {
+  method: 'POST',
+  token,
+  body: JSON.stringify({ receiptId, items }),
 })

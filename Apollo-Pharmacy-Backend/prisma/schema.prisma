@@ -41,3 +41,66 @@ model Appointment {
 	@@index([phoneNumber])
 }
 
+model StockReceipt {
+	id             String   @id @default(cuid())
+	fileName       String
+	mimeType       String
+	fileHash       String   @unique
+	fileData       Bytes
+	status         String   @default("PROCESSING")
+	uploadedBy     String
+	uploadedAt     DateTime @default(now())
+	processedAt    DateTime?
+	confirmedBy    String?
+	confirmedAt    DateTime?
+	errorMessage   String?
+
+	items          StockReceiptItem[]
+	transactions   StockTransaction[]
+
+	@@index([status, uploadedAt])
+}
+
+model StockReceiptItem {
+	id             String   @id @default(cuid())
+	receiptId      String
+	medicineName   String
+	brandName      String?
+	genericName    String?
+	strength       String?
+	dosageForm     String?
+	packSize       String?
+	quantity       Int?
+	unitPrice      Float?
+	totalPrice     Float?
+	batchNumber    String?
+	expiryDate     String?
+	confidence     Float    @default(0)
+	matchStatus    String   @default("UNMATCHED")
+	matchedMedicineId String?
+
+	receipt        StockReceipt @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+
+	@@index([receiptId])
+	@@index([matchedMedicineId])
+}
+
+model StockTransaction {
+	id             String   @id @default(cuid())
+	receiptId      String
+	medicineId     String
+	transactionType String
+	quantity       Int
+	previousStock  Int
+	newStock       Int
+	batchNumber    String?
+	expiryDate     String?
+	createdBy      String
+	createdAt      DateTime @default(now())
+
+	receipt        StockReceipt @relation(fields: [receiptId], references: [id], onDelete: Restrict)
+
+	@@index([medicineId, createdAt])
+	@@index([receiptId])
+}
+

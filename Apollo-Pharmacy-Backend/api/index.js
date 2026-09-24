@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const crypto = require('crypto');
 const express = require('express');
+const multer = require('multer');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
 const { Prisma, PrismaClient } = require('@prisma/client');
@@ -22,6 +23,19 @@ const allowedOrigins = process.env.FRONTEND_URL
 
 app.use(cors({ origin: allowedOrigins }));
 app.use(express.json({ limit: '16kb' }));
+
+const MAX_RECEIPT_SIZE = 10 * 1024 * 1024;
+const RECEIPT_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'application/pdf']);
+const receiptUpload = multer({
+	storage: multer.memoryStorage(),
+	limits: { fileSize: MAX_RECEIPT_SIZE, files: 1 },
+	fileFilter: (_req, file, callback) => callback(null, RECEIPT_MIME_TYPES.has(file.mimetype)),
+});
+
+const receiveReceipt = (req, res, next) => receiptUpload.single('receipt')(req, res, (error) => {
+	if (error) return res.status(400).json({ error: error.code === 'LIMIT_FILE_SIZE' ? 'Receipt must be 10 MB or smaller' : 'Upload a JPG, PNG, or PDF receipt' });
+	next();
+});
 
 const getAdminSecret = () => process.env.ADMIN_LOGIN_PASSWORD || process.env.ADMIN_API_KEY;
 
@@ -52,6 +66,7 @@ const requireAdmin = (req, res, next) => {
 		if (!validSignature || claims.sub !== 'admin' || claims.exp < Date.now()) {
 			return res.status(401).json({ error: 'Admin session expired' });
 		}
+		req.adminId = claims.sub;
 	} catch {
 		return res.status(401).json({ error: 'Invalid admin session' });
 	}
@@ -59,7 +74,8 @@ const requireAdmin = (req, res, next) => {
 	next();
 };
 
-const mailTransport = process.env.SMTP_HOST
+const mailFrom = process.env.MAIL_FROM || process.env.SMTP_USER;
+const mailTransport = process.env.SMTP_HOST && mailFrom
 	? nodemailer.createTransport({
 		host: process.env.SMTP_HOST,
 		port: Number(process.env.SMTP_PORT || 587),
@@ -69,9 +85,9 @@ const mailTransport = process.env.SMTP_HOST
 	: null;
 
 const sendAppointmentStatusEmail = async (appointment) => {
-	if (!mailTransport || !process.env.MAIL_FROM) return false;
+	if (!mailTransport) return false;
 	await mailTransport.sendMail({
-		from: process.env.MAIL_FROM,
+		from: mailFrom,
 		to: appointment.email,
 		subject: `Apollo Pharmacy appointment ${appointment.status.toLowerCase()}`,
 		text: [
@@ -95,6 +111,129 @@ const parseCsvLine = (line) => {
 		if (pattern.lastIndex >= line.length) break;
 	}
 	return values;
+};
+
+const receiptJsonSchema = {
+	type: 'object',
+	additionalProperties: false,
+	properties: {
+		items: {
+			type: 'array',
+			items: {
+				type: 'object',
+				additionalProperties: false,
+				properties: {
+					medicine_name: { type: 'string' },
+					brand_name: { type: ['string', 'null'] },
+					generic_name: { type: ['string', 'null'] },
+					strength: { type: ['string', 'null'] },
+					dosage_form: { type: ['string', 'null'] },
+					pack_size: { type: ['string', 'null'] },
+					quantity: { type: ['integer', 'null'] },
+					unit_price: { type: ['number', 'null'] },
+					total_price: { type: ['number', 'null'] },
+					batch_number: { type: ['string', 'null'] },
+					expiry_date: { type: ['string', 'null'] },
+					confidence: { type: 'number' },
+				},
+				required: ['medicine_name', 'brand_name', 'generic_name', 'strength', 'dosage_form', 'pack_size', 'quantity', 'unit_price', 'total_price', 'batch_number', 'expiry_date', 'confidence'],
+			},
+		},
+	},
+	required: ['items'],
+};
+
+const normalizeMedicineText = (value) => String(value || '').toLowerCase()
+	.replace(/milligrams?/g, 'mg')
+	.replace(/tablets?/g, 'tablet')
+	.replace(/capsules?/g, 'capsule')
+	.replace(/[^a-z0-9]+/g, ' ')
+	.trim();
+
+const levenshtein = (left, right) => {
+	const previous = Array.from({ length: right.length + 1 }, (_value, index) => index);
+	for (let row = 1; row <= left.length; row += 1) {
+		const current = [row];
+		for (let column = 1; column <= right.length; column += 1) {
+			current[column] = Math.min(
+				current[column - 1] + 1,
+				previous[column] + 1,
+				previous[column - 1] + (left[row - 1] === right[column - 1] ? 0 : 1),
+			);
+		}
+		previous.splice(0, previous.length, ...current);
+	}
+	return previous[right.length];
+};
+
+const textSimilarity = (left, right) => {
+	const normalizedLeft = normalizeMedicineText(left);
+	const normalizedRight = normalizeMedicineText(right);
+	if (!normalizedLeft || !normalizedRight) return 0;
+	if (normalizedLeft === normalizedRight) return 1;
+	if (normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft)) return 0.9;
+	return 1 - (levenshtein(normalizedLeft, normalizedRight) / Math.max(normalizedLeft.length, normalizedRight.length));
+};
+
+const matchReceiptMedicine = (item, medicines) => {
+	const receiptText = [item.medicine_name, item.brand_name, item.generic_name, item.strength, item.dosage_form].filter(Boolean).join(' ');
+	const ranked = medicines.map((medicine) => {
+		const nameScore = Math.max(textSimilarity(item.medicine_name, medicine.brandName), textSimilarity(item.brand_name, medicine.brandName));
+		const genericScore = textSimilarity(item.generic_name, medicine.genericName);
+		const strengthScore = item.strength ? textSimilarity(item.strength, medicine.strength) : 0.5;
+		const fullScore = textSimilarity(receiptText, [medicine.brandName, medicine.genericName, medicine.strength].join(' '));
+		return { medicine, score: (nameScore * 0.5) + (genericScore * 0.2) + (strengthScore * 0.15) + (fullScore * 0.15) };
+	}).sort((left, right) => right.score - left.score);
+	const best = ranked[0];
+	const second = ranked[1];
+	if (!best || best.score < 0.62 || (second && best.score - second.score < 0.06 && best.score < 0.86)) {
+		return { matchStatus: 'NEEDS_MANUAL', matchedMedicineId: null, matchScore: best?.score || 0 };
+	}
+	return { matchStatus: 'MATCHED', matchedMedicineId: best.medicine.id, matchScore: best.score };
+};
+
+const extractReceiptItems = async (file) => {
+	if (!process.env.OPENAI_API_KEY) throw new Error('Receipt AI processing is not configured');
+	const encodedFile = file.buffer.toString('base64');
+	const instruction = 'Read this pharmacy purchase receipt. Return only JSON matching the requested schema. Extract every medicine line, ignore non-medicine products, never guess unreadable quantities, use null for missing values, and set confidence from 0 to 1 based on legibility. Quantity means the number of packs or units purchased as printed.';
+	const isPdf = file.mimetype === 'application/pdf';
+	const configuredUrl = process.env.OPENAI_API_URL || 'https://api.openai.com/v1/chat/completions';
+	const url = isPdf && configuredUrl.endsWith('/chat/completions') ? configuredUrl.replace('/chat/completions', '/responses') : configuredUrl;
+	const body = isPdf
+		? {
+			model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+			input: [{ role: 'user', content: [{ type: 'input_text', text: instruction }, { type: 'input_file', filename: file.originalname, file_data: `data:${file.mimetype};base64,${encodedFile}` }] }],
+			text: { format: { type: 'json_schema', name: 'receipt_extraction', strict: true, schema: receiptJsonSchema } },
+		}
+		: {
+			model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+			messages: [{ role: 'user', content: [{ type: 'text', text: instruction }, { type: 'image_url', image_url: { url: `data:${file.mimetype};base64,${encodedFile}`, detail: 'high' } }] }],
+			response_format: { type: 'json_schema', json_schema: { name: 'receipt_extraction', strict: true, schema: receiptJsonSchema } },
+		};
+	const response = await fetch(url, {
+		method: 'POST',
+		headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+		body: JSON.stringify(body),
+	});
+	const payload = await response.json().catch(() => ({}));
+	if (!response.ok) throw new Error('Receipt AI processing failed');
+	const content = isPdf
+		? payload.output_text
+		: payload.choices?.[0]?.message?.content;
+	const parsed = typeof content === 'string' ? JSON.parse(content) : null;
+	if (!parsed || !Array.isArray(parsed.items)) throw new Error('Receipt AI returned invalid data');
+	return parsed.items;
+};
+
+const getReceiptDetails = async (receiptId) => {
+	const receipts = await prisma.$queryRaw(Prisma.sql`SELECT "id", "fileName", "mimeType", "status", "uploadedBy", "uploadedAt", "processedAt", "confirmedBy", "confirmedAt", "errorMessage" FROM "StockReceipt" WHERE "id" = ${receiptId}`);
+	if (receipts.length === 0) return null;
+	const items = await prisma.$queryRaw(Prisma.sql`
+		SELECT i.*, m."brandName" AS "matchedBrandName", m."genericName" AS "matchedGenericName", m."strength" AS "matchedStrength", m."availableQty" AS "currentStock"
+		FROM "StockReceiptItem" i LEFT JOIN "Medicine" m ON m."id" = i."matchedMedicineId"
+		WHERE i."receiptId" = ${receiptId} ORDER BY i."id"
+	`);
+	return serializeDatabaseValue({ ...receipts[0], items });
 };
 
 app.get('/api/health', (_req, res) => {
@@ -149,6 +288,120 @@ app.get('/api/medicines', async (req, res, next) => {
 
 		res.json(serializeDatabaseValue(medicines));
 	} catch (error) {
+		next(error);
+	}
+});
+
+app.post('/api/stock/receipt/upload', requireAdmin, receiveReceipt, async (req, res, next) => {
+	if (!req.file) return res.status(400).json({ error: 'A JPG, PNG, or PDF receipt is required' });
+	const fileHash = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
+	try {
+		const existing = await prisma.$queryRaw(Prisma.sql`SELECT "id", "status" FROM "StockReceipt" WHERE "fileHash" = ${fileHash}`);
+		if (existing.length > 0) return res.status(409).json({ error: 'This receipt has already been uploaded', receiptId: existing[0].id, status: existing[0].status });
+		const receiptId = crypto.randomUUID();
+		await prisma.$executeRaw(Prisma.sql`
+			INSERT INTO "StockReceipt" ("id", "fileName", "mimeType", "fileHash", "fileData", "status", "uploadedBy", "uploadedAt")
+			VALUES (${receiptId}, ${req.file.originalname}, ${req.file.mimetype}, ${fileHash}, ${req.file.buffer}, 'PROCESSING', ${req.adminId || 'admin'}, NOW())
+		`);
+		res.status(201).json({ receiptId, status: 'PROCESSING', fileName: req.file.originalname });
+	} catch (error) {
+		next(error);
+	}
+});
+
+app.post('/api/stock/receipt/process', requireAdmin, async (req, res, next) => {
+	const receiptId = typeof req.body?.receiptId === 'string' ? req.body.receiptId : '';
+	if (!receiptId) return res.status(400).json({ error: 'receiptId is required' });
+	try {
+		const receipts = await prisma.$queryRaw(Prisma.sql`SELECT "id", "fileName", "mimeType", "fileData", "status" FROM "StockReceipt" WHERE "id" = ${receiptId}`);
+		if (receipts.length === 0) return res.status(404).json({ error: 'Receipt not found' });
+		const receipt = receipts[0];
+		if (receipt.status === 'CONFIRMED') return res.status(409).json({ error: 'This receipt has already been confirmed' });
+		const extractedItems = await extractReceiptItems({ buffer: Buffer.from(receipt.fileData), mimetype: receipt.mimeType, originalname: receipt.fileName });
+		const medicines = await prisma.$queryRaw(Prisma.sql`SELECT "id", "brandName", "genericName", "strength", "availableQty" FROM "Medicine"`);
+		await prisma.$transaction(async (tx) => {
+			await tx.$executeRaw(Prisma.sql`DELETE FROM "StockReceiptItem" WHERE "receiptId" = ${receiptId}`);
+			for (const extractedItem of extractedItems) {
+				const match = matchReceiptMedicine(extractedItem, medicines);
+				const quantity = Number.isInteger(extractedItem.quantity) && extractedItem.quantity >= 0 ? extractedItem.quantity : null;
+				const confidence = Number.isFinite(Number(extractedItem.confidence)) ? Math.min(Math.max(Number(extractedItem.confidence), 0), 1) : 0;
+				await tx.$executeRaw(Prisma.sql`
+					INSERT INTO "StockReceiptItem" ("id", "receiptId", "medicineName", "brandName", "genericName", "strength", "dosageForm", "packSize", "quantity", "unitPrice", "totalPrice", "batchNumber", "expiryDate", "confidence", "matchStatus", "matchedMedicineId")
+					VALUES (${crypto.randomUUID()}, ${receiptId}, ${String(extractedItem.medicine_name || 'Unidentified item').trim()}, ${extractedItem.brand_name || null}, ${extractedItem.generic_name || null}, ${extractedItem.strength || null}, ${extractedItem.dosage_form || null}, ${extractedItem.pack_size || null}, ${quantity}, ${Number.isFinite(Number(extractedItem.unit_price)) ? Number(extractedItem.unit_price) : null}, ${Number.isFinite(Number(extractedItem.total_price)) ? Number(extractedItem.total_price) : null}, ${extractedItem.batch_number || null}, ${extractedItem.expiry_date || null}, ${confidence}, ${match.matchStatus}, ${match.matchedMedicineId})
+				`);
+			}
+			await tx.$executeRaw(Prisma.sql`UPDATE "StockReceipt" SET "status" = 'READY_FOR_REVIEW', "processedAt" = NOW(), "errorMessage" = NULL WHERE "id" = ${receiptId}`);
+		});
+		res.json(await getReceiptDetails(receiptId));
+	} catch (error) {
+		try {
+			await prisma.$executeRaw(Prisma.sql`UPDATE "StockReceipt" SET "status" = 'FAILED', "errorMessage" = ${error.message || 'Receipt processing failed'} WHERE "id" = ${receiptId}`);
+		} catch (updateError) {
+			console.error('Could not mark receipt processing failure:', updateError);
+		}
+		next(error);
+	}
+});
+
+app.get('/api/stock/receipt/:id', requireAdmin, async (req, res, next) => {
+	try {
+		const receipt = await getReceiptDetails(req.params.id);
+		if (!receipt) return res.status(404).json({ error: 'Receipt not found' });
+		res.json(receipt);
+	} catch (error) {
+		next(error);
+	}
+});
+
+app.post('/api/stock/receipt/confirm', requireAdmin, async (req, res, next) => {
+	const receiptId = typeof req.body?.receiptId === 'string' ? req.body.receiptId : '';
+	const reviewItems = Array.isArray(req.body?.items) ? req.body.items : null;
+	if (!receiptId || !reviewItems) return res.status(400).json({ error: 'receiptId and review items are required' });
+	if (reviewItems.length > 100) return res.status(400).json({ error: 'A receipt cannot contain more than 100 items' });
+	const itemIds = new Set();
+	for (const item of reviewItems) {
+		if (!item || typeof item.id !== 'string' || itemIds.has(item.id) || typeof item.medicineId !== 'string' || !Number.isInteger(item.quantity) || item.quantity <= 0 || item.quantity > 1000000) {
+			return res.status(400).json({ error: 'Each confirmed item needs a unique id, medicine, and positive quantity' });
+		}
+		itemIds.add(item.id);
+	}
+
+	try {
+		const result = await prisma.$transaction(async (tx) => {
+			const receipts = await tx.$queryRaw(Prisma.sql`SELECT "id", "status" FROM "StockReceipt" WHERE "id" = ${receiptId} FOR UPDATE`);
+			if (receipts.length === 0) return { type: 'missing' };
+			if (receipts[0].status === 'CONFIRMED') {
+				const transactions = await tx.$queryRaw(Prisma.sql`SELECT "medicineId", "previousStock", "quantity", "newStock" FROM "StockTransaction" WHERE "receiptId" = ${receiptId} ORDER BY "createdAt" ASC`);
+				return { type: 'already-confirmed', transactions };
+			}
+			if (receipts[0].status !== 'READY_FOR_REVIEW') return { type: 'not-ready' };
+
+			const receiptItems = await tx.$queryRaw(Prisma.sql`SELECT "id", "medicineName", "quantity", "matchedMedicineId", "batchNumber", "expiryDate" FROM "StockReceiptItem" WHERE "receiptId" = ${receiptId} FOR UPDATE`);
+			const receiptItemMap = new Map(receiptItems.map((item) => [item.id, item]));
+			const updated = [];
+			for (const reviewItem of reviewItems) {
+				const receiptItem = receiptItemMap.get(reviewItem.id);
+				if (!receiptItem) throw new Error('Receipt item does not belong to this receipt');
+				const medicines = await tx.$queryRaw(Prisma.sql`SELECT "id", "availableQty" FROM "Medicine" WHERE "id" = ${reviewItem.medicineId} FOR UPDATE`);
+				if (medicines.length === 0) throw new Error('One selected medicine no longer exists');
+				const previousStock = Number(medicines[0].availableQty);
+				const newStock = previousStock + reviewItem.quantity;
+				if (newStock > 2147483647) throw new Error('Stock quantity is too large');
+				await tx.$executeRaw(Prisma.sql`UPDATE "Medicine" SET "availableQty" = ${newStock}, "updatedAt" = NOW() WHERE "id" = ${reviewItem.medicineId}`);
+				await tx.$executeRaw(Prisma.sql`UPDATE "StockReceiptItem" SET "medicineName" = ${typeof reviewItem.medicineName === 'string' && reviewItem.medicineName.trim() ? reviewItem.medicineName.trim() : receiptItem.medicineName}, "quantity" = ${reviewItem.quantity}, "matchedMedicineId" = ${reviewItem.medicineId}, "matchStatus" = 'MATCHED' WHERE "id" = ${reviewItem.id}`);
+				await tx.$executeRaw(Prisma.sql`INSERT INTO "StockTransaction" ("id", "receiptId", "medicineId", "transactionType", "quantity", "previousStock", "newStock", "batchNumber", "expiryDate", "createdBy") VALUES (${crypto.randomUUID()}, ${receiptId}, ${reviewItem.medicineId}, 'PURCHASE_RECEIPT', ${reviewItem.quantity}, ${previousStock}, ${newStock}, ${receiptItem.batchNumber}, ${receiptItem.expiryDate}, ${req.adminId || 'admin'})`);
+				updated.push({ medicineId: reviewItem.medicineId, previousStock, quantityAdded: reviewItem.quantity, newStock });
+			}
+			const skipped = receiptItems.filter((item) => !itemIds.has(item.id)).map((item) => ({ id: item.id, medicineName: item.medicineName, reason: item.quantity === null ? 'Quantity is missing' : 'Not matched or skipped' }));
+			await tx.$executeRaw(Prisma.sql`UPDATE "StockReceipt" SET "status" = 'CONFIRMED', "confirmedBy" = ${req.adminId || 'admin'}, "confirmedAt" = NOW(), "fileData" = ${Buffer.alloc(0)} WHERE "id" = ${receiptId}`);
+			return { type: 'confirmed', updated, skipped };
+		});
+		if (result.type === 'missing') return res.status(404).json({ error: 'Receipt not found' });
+		if (result.type === 'not-ready') return res.status(409).json({ error: 'Receipt is not ready for confirmation' });
+		if (result.type === 'already-confirmed') return res.json({ status: 'CONFIRMED', alreadyConfirmed: true, updated: result.transactions.map((item) => ({ medicineId: item.medicineId, previousStock: Number(item.previousStock), quantityAdded: Number(item.quantity), newStock: Number(item.newStock) })), skipped: [] });
+		res.json({ status: 'CONFIRMED', ...result });
+	} catch (error) {
+		if (error.message === 'One selected medicine no longer exists' || error.message === 'Receipt item does not belong to this receipt' || error.message === 'Stock quantity is too large') return res.status(400).json({ error: error.message });
 		next(error);
 	}
 });

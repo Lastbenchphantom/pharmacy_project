@@ -198,7 +198,7 @@ function AdminDashboard({ token, onLogout }) {
           ? ' This appointment has no email address; create a new booking with email.'
           : updated.notificationReason === 'delivery-failed'
             ? ' Email delivery failed; check the backend SMTP logs.'
-            : ' SMTP is not loaded by the running backend.'
+            : ' Appointment status saved, but email notifications are not configured on the running backend.'
       setMessage(`Appointment ${status.toLowerCase()}.${notificationMessage}`)
     } catch (error) {
       setMessage(error.message)
@@ -222,6 +222,7 @@ function AdminDashboard({ token, onLogout }) {
       <div className="mx-auto max-w-6xl">
         <header className="flex flex-wrap items-center justify-between gap-4">
           <div><a href="/" className="text-sm font-bold text-[#2f80c0]">← Public site</a><h1 className="mt-2 text-4xl font-extrabold">Pharmacy operations</h1></div>
+          <a href="/admin/stock-receipt" className="rounded-xl bg-[#2f80c0] px-4 py-2 font-bold text-white hover:bg-[#18527f]">Update stock from receipt</a>
           <button type="button" onClick={onLogout} className="rounded-xl border border-[#d9e7f0] bg-white px-4 py-2 font-bold dark:border-slate-700 dark:bg-[#172b3d]">Sign out</button>
         </header>
         {message && <p className="mt-6 rounded-xl bg-[#e7f4fc] p-3 font-semibold text-[#18527f]">{message}</p>}

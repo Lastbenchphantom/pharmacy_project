@@ -3,18 +3,18 @@
 	"version": "1.0.0",
 	"private": true,
 	"main": "api/index.js",
-	  "scripts": {
-    "dev": "node api/index.js",
-    "prisma:generate": "npx prisma generate",
-    "prisma:validate": "npx prisma validate",
-    "vercel-build": "npx prisma generate"
-  },
-
+	"scripts": {
+		"dev": "node api/index.js",
+		"prisma:generate": "npx prisma generate",
+		"prisma:validate": "npx prisma validate",
+		"vercel-build": "npx prisma generate"
+	},
 	"dependencies": {
 		"@prisma/client": "^6.0.0",
 		"cors": "^2.8.5",
 		"dotenv": "^16.4.5",
 		"express": "^4.21.2",
+		"multer": "^2.4.0",
 		"nodemailer": "^10.0.10"
 	},
 	"devDependencies": {
