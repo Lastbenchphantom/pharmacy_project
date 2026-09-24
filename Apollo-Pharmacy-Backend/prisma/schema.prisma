@@ -1,0 +1,40 @@
+generator client {
+	provider = "prisma-client-js"
+}
+
+datasource db {
+	provider = "postgresql"
+	url      = env("DATABASE_URL")
+}
+
+model Medicine {
+	id            String   @id @default(cuid())
+	brandName     String
+	genericName   String
+	manufacturer  String
+	strength      String
+	availableQty  Int      @default(0)
+	singlePiecePrice Float  @default(0) @map("piece_price")
+	fullBoxPrice  Float    @default(0) @map("box_price")
+	createdAt     DateTime @default(now())
+	updatedAt     DateTime @updatedAt
+
+	@@index([brandName])
+	@@index([genericName])
+}
+
+model Appointment {
+	id          String   @id @default(cuid())
+	patientName String
+	phoneNumber String
+	doctorName  String
+	timeSlot    String
+	email       String
+	status      String   @default("PENDING")
+	note        String?
+	createdAt   DateTime @default(now())
+	updatedAt   DateTime @updatedAt
+
+	@@index([doctorName, timeSlot])
+	@@index([phoneNumber])
+}

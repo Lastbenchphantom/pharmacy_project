@@ -1,0 +1,11 @@
+[
+  {
+    "id": "doctor-md-jarjit-hossain-apollo",
+    "name": "Md. Jarjit Hossain Apollo",
+    "specialty": "Medical Practitioner",
+    "qualifications": ["L.M.A.F", "C.M.A.F", "M.B.V.D.A (R.M.P - Dhaka)"],
+    "registrationNumber": "C/106854 (B.F.C.)",
+    "visitingHours": { "morning": "9:00 AM - 12:00 PM", "evening": "6:00 PM - 11:00 PM" },
+    "contactNumbers": ["01711-444490", "01833-605822"]
+  }
+]

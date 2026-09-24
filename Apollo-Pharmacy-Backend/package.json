@@ -1,0 +1,27 @@
+{
+	"name": "apollo-pharmacy-backend",
+	"version": "1.0.0",
+	"private": true,
+	"main": "api/index.js",
+	"scripts": {
+		"dev": "node api/index.js",
+		"prisma:generate": "prisma generate",
+		"prisma:validate": "prisma validate",
+		"vercel-build": "prisma generate && prisma migrate deploy"
+	},
+	"dependencies": {
+		"@prisma/client": "^6.0.0",
+		"cors": "^2.8.5",
+		"dotenv": "^16.4.5",
+		"express": "^4.21.2",
+		"nodemailer": "^10.0.10"
+	},
+	"devDependencies": {
+		"prisma": "^6.0.0"
+	},
+	"allowScripts": {
+		"prisma@6.19.3": true,
+		"@prisma/client@6.19.3": true,
+		"@prisma/engines@6.19.3": true
+	}
+}
