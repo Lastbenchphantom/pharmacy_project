@@ -85,7 +85,7 @@ function PublicApp() {
 
         <nav className="flex flex-wrap items-center gap-4 text-sm text-[#607487] dark:text-slate-300" aria-label="Main navigation">
           <a className="transition-colors hover:text-[#2f80c0]" href="#services">Services</a>
-          <a className="transition-colors hover:text-[#2f80c0]" href="#catalog">Catalog</a>
+          <a className="transition-colors hover:text-[#2f80c0]" href="#catalog">Medicine</a>
           <a className="transition-colors hover:text-[#2f80c0]" href="#booking">Appointments</a>
           <a className="transition-colors hover:text-[#2f80c0]" href="#ai">AI Assistant</a>
           <a className="transition-colors hover:text-[#2f80c0]" href="/admin">Admin</a>
@@ -115,9 +115,6 @@ function PublicApp() {
               <button type="button" className="rounded-xl bg-[#2f80c0] px-6 py-4 font-bold text-white shadow-lg shadow-[#2f80c0]/30 transition hover:bg-[#18527f]">
                 Shop now
               </button>
-              <button type="button" className="rounded-xl border border-white bg-white/95 px-6 py-4 font-bold text-[#18527f] transition hover:bg-[#e7f4fc]">
-                Book a doctor
-              </button>
             </div>
 
           </div>
@@ -130,13 +127,6 @@ function PublicApp() {
                 {categories.map((item) => (
                   <span className="rounded-full bg-[#e7f4fc] px-3 py-2 text-xs font-semibold text-[#172b3d]" key={item}>{item}</span>
                 ))}
-              </div>
-              <div className="mt-7 flex items-center justify-between border-t border-[#d9e7f0] pt-5">
-                <div>
-                  <label className="mb-1 block text-xs text-[#607487]">Prescription status</label>
-                  <strong className="text-[#172b3d]">Ready to dispatch</strong>
-                </div>
-                <div className="rounded-full bg-[#e7f4fc] px-3 py-2 text-xs font-bold text-[#18527f]">Live</div>
               </div>
             </div>
 
