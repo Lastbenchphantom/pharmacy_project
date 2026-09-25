@@ -8,10 +8,34 @@ const BATCH_RE = /(?:batch|b(?:atch)?[\s.\-]*no\.?|lot)[:\s#]*([A-Za-z0-9\-./]+)
 const EXPIRY_RE = /(?:exp(?:iry)?|exp\.?\s*date|use\s*before)[:\s]*([0-9]{1,2}[\/\-.][0-9]{1,2}[\/\-.][0-9]{2,4}|[0-9]{1,2}[\/\-.][0-9]{2,4}|[A-Za-z]{3,9}[\s\-\/]?[0-9]{2,4}|[0-9]{4}-[0-9]{2}-[0-9]{2})/i;
 const PRICE_RE = /(?:tk\.?|bdt|৳)\s*(\d+(?:\.\d{1,2})?)\b/i;
 
+/** Keep OCR under typical Vercel serverless limits so failures can mark FAILED before hard kill. */
+const OCR_IMAGE_TIMEOUT_MS = Number.parseInt(process.env.RECEIPT_OCR_TIMEOUT_MS, 10) || 45_000;
+const PDF_PARSE_TIMEOUT_MS = Number.parseInt(process.env.RECEIPT_PDF_TIMEOUT_MS, 10) || 15_000;
+
 const cleanLine = (line) => String(line || '')
 	.replace(/[|_]+/g, ' ')
 	.replace(/\s{2,}/g, ' ')
 	.trim();
+
+const withTimeout = (promise, timeoutMs, message) => {
+	let timer;
+	const timeoutPromise = new Promise((_, reject) => {
+		timer = setTimeout(() => {
+			const error = new Error(message);
+			error.statusCode = 504;
+			error.code = 'RECEIPT_OCR_TIMEOUT';
+			reject(error);
+		}, timeoutMs);
+	});
+	return Promise.race([promise, timeoutPromise]).finally(() => {
+		clearTimeout(timer);
+	});
+};
+
+const logOcrStep = (step, startedAt, extra = {}) => {
+	const elapsedMs = Date.now() - startedAt;
+	console.info('[receipt-ocr]', { step, elapsedMs, ...extra });
+};
 
 /**
  * Lazy-load pdf-parse only for PDF receipts.
@@ -24,14 +48,18 @@ const extractPdfText = async (buffer) => {
 	return typeof result?.text === 'string' ? result.text : '';
 };
 
-const ocrImageBuffer = async (buffer) => {
+const ocrImageBuffer = async (buffer, timeoutMs = OCR_IMAGE_TIMEOUT_MS) => {
 	const worker = await createWorker('eng', 1, {
 		cachePath: process.env.TESS_CACHE_PATH || '/tmp',
 		logger: () => {},
 	});
 	try {
-		const { data } = await worker.recognize(buffer);
-		return data?.text || '';
+		const text = await withTimeout(
+			worker.recognize(buffer).then(({ data }) => data?.text || ''),
+			timeoutMs,
+			'Receipt processing timed out. Please retry.',
+		);
+		return text;
 	} finally {
 		await worker.terminate().catch(() => {});
 	}
@@ -124,25 +152,40 @@ const parseReceiptText = (rawText) => {
 };
 
 const extractReceiptItemsWithTesseract = async (file) => {
+	const overallStartedAt = Date.now();
 	const fileBuffer = Buffer.isBuffer(file.buffer) ? file.buffer : Buffer.from(file.buffer);
+	const mimeType = file.mimetype || 'unknown';
+	const byteLength = fileBuffer.length;
+	logOcrStep('start', overallStartedAt, { mimeType, byteLength });
+
 	if (!fileBuffer.length) {
-		const error = new Error('Uploaded receipt file data is empty');
+		const error = new Error('Could not read this receipt. Please upload a clearer JPG or PNG.');
 		error.statusCode = 400;
 		throw error;
 	}
 
 	let text = '';
-	const isPdf = file.mimetype === 'application/pdf';
+	const isPdf = mimeType === 'application/pdf';
 	try {
 		if (isPdf) {
-			text = await extractPdfText(fileBuffer);
+			const pdfStartedAt = Date.now();
+			logOcrStep('pdf_parse_begin', pdfStartedAt, { mimeType, byteLength });
+			text = await withTimeout(
+				extractPdfText(fileBuffer),
+				PDF_PARSE_TIMEOUT_MS,
+				'Receipt processing timed out. Please retry.',
+			);
+			logOcrStep('pdf_parse_done', pdfStartedAt, { textLength: text.trim().length });
 			if (!text || text.trim().length < 12) {
-				const error = new Error('This PDF has little readable text. Export or photograph the receipt as JPG/PNG and upload again for OCR.');
+				const error = new Error('Scanned/image-only PDF is not currently supported. Please upload the receipt as JPG or PNG.');
 				error.statusCode = 422;
 				throw error;
 			}
 		} else {
-			text = await ocrImageBuffer(fileBuffer);
+			const ocrStartedAt = Date.now();
+			logOcrStep('image_ocr_begin', ocrStartedAt, { mimeType, byteLength });
+			text = await ocrImageBuffer(fileBuffer, OCR_IMAGE_TIMEOUT_MS);
+			logOcrStep('image_ocr_done', ocrStartedAt, { textLength: String(text || '').trim().length });
 		}
 	} catch (ocrError) {
 		if (ocrError.statusCode) throw ocrError;
@@ -155,23 +198,33 @@ const extractReceiptItemsWithTesseract = async (file) => {
 		const looksCorrupt = /invalid pdf|bad xref|pdf structure|password|encrypted|format error|unexpected/i.test(message);
 		const error = new Error(
 			looksCorrupt
-				? 'This PDF could not be read. Try another file or upload a JPG/PNG photo of the receipt.'
-				: `Receipt OCR failed: ${message}`,
+				? 'Could not read this receipt. Please upload a clearer JPG or PNG.'
+				: 'AI processing failed. Please retry.',
 		);
 		error.statusCode = looksCorrupt ? 422 : 502;
+		error.cause = ocrError;
 		throw error;
 	}
 
+	const parseStartedAt = Date.now();
 	const items = parseReceiptText(text);
+	logOcrStep('text_parse_done', parseStartedAt, { itemCount: items.length });
 	if (items.length === 0) {
-		const error = new Error('OCR could not find medicine lines on this receipt. Try a clearer photo or enter items manually after upload.');
+		const error = new Error(
+			isPdf
+				? 'Scanned/image-only PDF is not currently supported. Please upload the receipt as JPG or PNG.'
+				: 'Could not read this receipt. Please upload a clearer JPG or PNG.',
+		);
 		error.statusCode = 422;
 		throw error;
 	}
+	logOcrStep('complete', overallStartedAt, { itemCount: items.length, mimeType });
 	return items;
 };
 
 module.exports = {
 	extractReceiptItemsWithTesseract,
 	parseReceiptText,
+	OCR_IMAGE_TIMEOUT_MS,
+	PDF_PARSE_TIMEOUT_MS,
 };

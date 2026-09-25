@@ -32,7 +32,10 @@ async function request(path, options = {}) {
     : {}
 
   if (!response.ok) {
-    throw new Error(data.error || 'The pharmacy service is unavailable.')
+    const error = new Error(data.error || 'The pharmacy service is unavailable.')
+    error.status = response.status
+    error.data = data
+    throw error
   }
   if (!contentType.includes('application/json')) {
     throw new Error('The pharmacy service returned an unexpected response.')
@@ -102,13 +105,24 @@ export const uploadStockReceipt = (token, file) => {
   return request('/stock/receipt/upload', { method: 'POST', token, body })
 }
 
+const processReceiptTimeoutSignal = () => (
+  typeof AbortSignal !== 'undefined' && AbortSignal.timeout
+    ? AbortSignal.timeout(120_000)
+    : undefined
+)
+
 export const processStockReceipt = (token, receiptId) => request('/stock/receipt/process', {
   method: 'POST',
   token,
   body: JSON.stringify({ receiptId }),
-  signal: typeof AbortSignal !== 'undefined' && AbortSignal.timeout
-    ? AbortSignal.timeout(120_000)
-    : undefined,
+  signal: processReceiptTimeoutSignal(),
+})
+
+export const retryStockReceipt = (token, receiptId) => request('/stock/receipt/retry', {
+  method: 'POST',
+  token,
+  body: JSON.stringify({ receiptId }),
+  signal: processReceiptTimeoutSignal(),
 })
 
 export const getStockReceipt = (token, receiptId) => request(`/stock/receipt/${receiptId}`, { token })
@@ -117,6 +131,11 @@ export const confirmStockReceipt = (token, receiptId, items) => request('/stock/
   method: 'POST',
   token,
   body: JSON.stringify({ receiptId, items }),
+})
+
+export const deleteReceipt = (token, receiptId) => request(`/admin/receipts/${encodeURIComponent(receiptId)}`, {
+  method: 'DELETE',
+  token,
 })
 
 export const getDashboard = (token) => request('/admin/dashboard', { token })

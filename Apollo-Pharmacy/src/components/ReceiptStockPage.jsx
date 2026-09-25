@@ -1,14 +1,18 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   confirmStockReceipt,
   getMedicines,
   getStockReceipt,
   processStockReceipt,
+  retryStockReceipt,
   uploadStockReceipt,
 } from '../api'
 
 const TOKEN_KEY = 'apollo-admin-token'
 const MAX_FILE_SIZE = 10 * 1024 * 1024
+const MAX_CLIENT_RETRIES = 3
+const POLL_INTERVAL_MS = 2500
+const POLL_TIMEOUT_MS = 90_000
 
 const steps = [
   ['upload', '1. Upload Receipt'],
@@ -16,6 +20,18 @@ const steps = [
   ['review', '3. Review and Confirm'],
   ['success', '4. Stock Updated'],
 ]
+
+const humanizeReceiptError = (message) => {
+  const text = String(message || '').trim()
+  if (!text) return 'Receipt processing failed. Please try again.'
+  if (/timed out|timeout/i.test(text)) return 'Receipt processing timed out. Please retry.'
+  if (/scanned\/image-only pdf/i.test(text)) {
+    return 'Scanned/image-only PDF is not currently supported. Please upload the receipt as JPG or PNG.'
+  }
+  if (/already been uploaded/i.test(text)) return text
+  if (/already being processed/i.test(text)) return text
+  return text
+}
 
 const mapReceiptRows = (items) => items.map((item) => ({
   ...item,
@@ -106,6 +122,16 @@ export default function ReceiptStockPage() {
     const params = new URLSearchParams(window.location.search)
     return Boolean(params.get('receiptId'))
   })
+  const [retryCount, setRetryCount] = useState(0)
+  const pollTimerRef = useRef(null)
+  const processingRef = useRef(false)
+
+  const clearPoll = () => {
+    if (pollTimerRef.current) {
+      clearTimeout(pollTimerRef.current)
+      pollTimerRef.current = null
+    }
+  }
 
   useEffect(() => {
     if (!file) {
@@ -121,6 +147,105 @@ export default function ReceiptStockPage() {
       URL.revokeObjectURL(url)
     }
   }, [file])
+
+  const applyReadyReceipt = (processed) => {
+    setReceipt(processed)
+    setRows(mapReceiptRows(processed.items || []))
+    setStatus('review')
+    setError('')
+  }
+
+  const applyFailedReceipt = (failedReceipt, fallbackMessage) => {
+    setReceipt(failedReceipt || null)
+    setStatus('failed')
+    setError(humanizeReceiptError(
+      fallbackMessage
+      || failedReceipt?.errorMessage
+      || 'Receipt processing failed. Please try again.',
+    ))
+  }
+
+  const pollUntilSettled = async (receiptId, cancelled) => {
+    const deadline = Date.now() + POLL_TIMEOUT_MS
+    while (!cancelled?.() && Date.now() < deadline) {
+      const latest = await getStockReceipt(token, receiptId)
+      if (cancelled?.()) return null
+      setReceipt(latest)
+      if (latest.status === 'READY_FOR_REVIEW') return { type: 'ready', receipt: latest }
+      if (latest.status === 'FAILED') return { type: 'failed', receipt: latest }
+      if (latest.status === 'CONFIRMED') return { type: 'confirmed', receipt: latest }
+      await new Promise((resolve) => {
+        pollTimerRef.current = setTimeout(resolve, POLL_INTERVAL_MS)
+      })
+    }
+    return { type: 'timeout' }
+  }
+
+  const runProcess = async (receiptId, { useRetryEndpoint = false } = {}) => {
+    if (processingRef.current) {
+      setError('This receipt is already being processed. Please wait.')
+      return
+    }
+    processingRef.current = true
+    setIsWorking(true)
+    setError('')
+    setStatus('processing')
+    clearPoll()
+    try {
+      const processFn = useRetryEndpoint ? retryStockReceipt : processStockReceipt
+      const processed = await processFn(token, receiptId)
+      if (processed.status === 'READY_FOR_REVIEW') {
+        applyReadyReceipt(processed)
+        return
+      }
+      if (processed.status === 'FAILED') {
+        applyFailedReceipt(processed)
+        return
+      }
+      // Unexpected mid-state — poll briefly instead of spinning forever.
+      const settled = await pollUntilSettled(receiptId, () => false)
+      if (settled?.type === 'ready') applyReadyReceipt(settled.receipt)
+      else if (settled?.type === 'failed') applyFailedReceipt(settled.receipt)
+      else if (settled?.type === 'confirmed') {
+        setStatus('success')
+        setResult({ updated: [], skipped: [], alreadyConfirmed: true })
+        setError('This receipt is already confirmed.')
+      } else {
+        applyFailedReceipt(null, 'Receipt processing timed out. Please retry.')
+      }
+    } catch (processError) {
+      // Backend may have marked FAILED even when the HTTP request timed out.
+      try {
+        const latest = await getStockReceipt(token, receiptId)
+        if (latest.status === 'READY_FOR_REVIEW') {
+          applyReadyReceipt(latest)
+          return
+        }
+        if (latest.status === 'FAILED') {
+          applyFailedReceipt(latest, processError.message)
+          return
+        }
+        if (latest.status === 'PROCESSING') {
+          const settled = await pollUntilSettled(receiptId, () => false)
+          if (settled?.type === 'ready') {
+            applyReadyReceipt(settled.receipt)
+            return
+          }
+          if (settled?.type === 'failed') {
+            applyFailedReceipt(settled.receipt, processError.message)
+            return
+          }
+        }
+      } catch {
+        // Fall through to client error message.
+      }
+      applyFailedReceipt(receipt ? { ...receipt, status: 'FAILED' } : { id: receiptId, status: 'FAILED' }, processError.message)
+    } finally {
+      processingRef.current = false
+      setIsWorking(false)
+      clearPoll()
+    }
+  }
 
   useEffect(() => {
     if (!token) return undefined
@@ -140,6 +265,7 @@ export default function ReceiptStockPage() {
         const loaded = await getStockReceipt(token, receiptId)
         if (cancelled) return
         setReceipt(loaded)
+
         if (loaded.status === 'READY_FOR_REVIEW') {
           setRows(mapReceiptRows(loaded.items || []))
           setStatus('review')
@@ -155,26 +281,34 @@ export default function ReceiptStockPage() {
           setError('This receipt is already confirmed.')
           return
         }
-        if (loaded.status === 'FAILED' || loaded.status === 'PROCESSING') {
-          setStatus('processing')
-          setIsWorking(true)
-          try {
-            const processed = await processStockReceipt(token, receiptId)
+        if (loaded.status === 'FAILED') {
+          const shouldAutoRetry = params.get('retry') === '1'
+          if (shouldAutoRetry) {
             if (cancelled) return
-            setReceipt(processed)
-            setRows(mapReceiptRows(processed.items || []))
-            setStatus('review')
-          } catch (processError) {
-            if (cancelled) return
-            setError(processError.message || loaded.errorMessage || 'Receipt processing failed.')
-            setStatus('upload')
-          } finally {
-            if (!cancelled) setIsWorking(false)
+            setBootstrapping(false)
+            setRetryCount(1)
+            await runProcess(receiptId, { useRetryEndpoint: true })
+            if (!cancelled) {
+              window.history.replaceState({}, '', `/admin/stock-receipt?receiptId=${encodeURIComponent(receiptId)}`)
+            }
+            return
           }
+          applyFailedReceipt(loaded)
+          return
         }
+        if (loaded.status === 'PROCESSING') {
+          if (cancelled) return
+          // End bootstrap spinner before OCR so UI shows step 2, not "Loading receipt…"
+          setBootstrapping(false)
+          setStatus('processing')
+          await runProcess(receiptId)
+          return
+        }
+        setError(`Unsupported receipt status: ${loaded.status}`)
+        setStatus('upload')
       } catch (loadError) {
         if (!cancelled) {
-          setError(loadError.message)
+          setError(humanizeReceiptError(loadError.message))
           setStatus('upload')
         }
       } finally {
@@ -185,6 +319,7 @@ export default function ReceiptStockPage() {
 
     return () => {
       cancelled = true
+      clearPoll()
     }
   }, [token])
 
@@ -192,6 +327,7 @@ export default function ReceiptStockPage() {
     const selectedFile = event.target.files?.[0]
     setError('')
     setResult(null)
+    setRetryCount(0)
     if (!selectedFile) return
     if (!['image/jpeg', 'image/png', 'application/pdf'].includes(selectedFile.type)) {
       setError('Choose a JPG, PNG, or PDF receipt.')
@@ -208,25 +344,55 @@ export default function ReceiptStockPage() {
   }
 
   const startProcessing = async () => {
-    if (!file) {
+    if (!file && !receipt?.id) {
       setError('Select a receipt before processing.')
       return
     }
-    setIsWorking(true)
     setError('')
     setStatus('processing')
     try {
-      const uploaded = await uploadStockReceipt(token, file)
-      const processed = await processStockReceipt(token, uploaded.receiptId)
-      setReceipt(processed)
-      setRows(mapReceiptRows(processed.items))
-      setStatus('review')
+      let receiptId = receipt?.id
+      if (!receiptId) {
+        try {
+          const uploaded = await uploadStockReceipt(token, file)
+          receiptId = uploaded.receiptId
+          setReceipt({ id: receiptId, fileName: uploaded.fileName || file.name, status: 'PROCESSING' })
+        } catch (uploadError) {
+          const existingId = uploadError?.data?.receiptId
+          if (uploadError?.status === 409 && existingId) {
+            receiptId = existingId
+            setReceipt({
+              id: existingId,
+              fileName: file.name,
+              status: uploadError.data?.status || 'FAILED',
+            })
+          } else {
+            setError(humanizeReceiptError(uploadError.message || 'Upload failed.'))
+            setStatus('upload')
+            return
+          }
+        }
+      }
+      await runProcess(receiptId, {
+        useRetryEndpoint: Boolean(receipt?.status === 'FAILED'),
+      })
     } catch (processingError) {
-      setError(processingError.message || 'Receipt processing failed.')
-      setStatus('upload')
-    } finally {
-      setIsWorking(false)
+      setError(humanizeReceiptError(processingError.message || 'Receipt processing failed.'))
+      setStatus(receipt?.id ? 'failed' : 'upload')
     }
+  }
+
+  const handleRetry = async () => {
+    if (!receipt?.id) {
+      setError('No receipt to retry.')
+      return
+    }
+    if (retryCount >= MAX_CLIENT_RETRIES) {
+      setError(`Retry limit reached (${MAX_CLIENT_RETRIES}). Upload a clearer JPG or PNG, or try again later.`)
+      return
+    }
+    setRetryCount((count) => count + 1)
+    await runProcess(receipt.id, { useRetryEndpoint: receipt.status === 'FAILED' || status === 'failed' })
   }
 
   const updateRow = (id, field, value) => {
@@ -289,6 +455,8 @@ export default function ReceiptStockPage() {
     )
   }
 
+  const activeStep = status === 'failed' ? 'processing' : status
+
   return (
     <main className="min-h-screen bg-[#f4f9fc] px-4 py-8 text-[#172b3d] dark:bg-[#101d2b] dark:text-white sm:px-8">
       <div className="mx-auto max-w-7xl">
@@ -298,11 +466,12 @@ export default function ReceiptStockPage() {
             <h1 className="mt-2 text-4xl font-extrabold">Update stock from receipt</h1>
             <p className="mt-2 text-[#607487] dark:text-slate-300">AI prepares the review. Expiry is required before stock increases.</p>
           </div>
+          <a href="/admin/receipts" className="rounded-xl border border-[#d9e7f0] bg-white px-4 py-2 text-sm font-bold text-[#18527f] dark:border-slate-600 dark:bg-[#172b3d] dark:text-slate-100">Receipts list</a>
         </header>
 
         <nav className="mt-8 grid gap-2 sm:grid-cols-4" aria-label="Receipt workflow">
           {steps.map(([step, label]) => (
-            <div key={step} className={`rounded-xl border px-4 py-3 text-sm font-bold ${status === step ? 'border-[#2f80c0] bg-[#e7f4fc] text-[#18527f]' : 'border-[#d9e7f0] bg-white text-[#607487] dark:border-slate-700 dark:bg-[#172b3d]'}`}>{label}</div>
+            <div key={step} className={`rounded-xl border px-4 py-3 text-sm font-bold ${activeStep === step ? 'border-[#2f80c0] bg-[#e7f4fc] text-[#18527f]' : 'border-[#d9e7f0] bg-white text-[#607487] dark:border-slate-700 dark:bg-[#172b3d]'}`}>{label}</div>
           ))}
         </nav>
 
@@ -346,6 +515,42 @@ export default function ReceiptStockPage() {
             <div className="mx-auto h-12 w-12 animate-spin rounded-full border-4 border-[#d9e7f0] border-t-[#2f80c0]" />
             <h2 className="mt-6 text-2xl font-extrabold">Reading your receipt</h2>
             <p className="mt-2 text-[#607487] dark:text-slate-300">Extracting medicines and matching them against live stock. Stock has not changed.</p>
+          </section>
+        )}
+
+        {!bootstrapping && status === 'failed' && (
+          <section className="mt-8 rounded-3xl border border-[#f0c7c3] bg-white p-8 text-center shadow-lg dark:border-[#7a3b36] dark:bg-[#172b3d]">
+            <h2 className="text-2xl font-extrabold text-[#b94f49]">Receipt processing failed</h2>
+            <p className="mt-3 text-[#607487] dark:text-slate-300">
+              {receipt?.fileName ? `${receipt.fileName} · ` : ''}
+              Please retry or upload a clearer JPG/PNG.
+            </p>
+            <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
+              <button
+                type="button"
+                disabled={isWorking || retryCount >= MAX_CLIENT_RETRIES}
+                onClick={handleRetry}
+                className="rounded-xl bg-[#2f80c0] px-5 py-3 font-bold text-white hover:bg-[#18527f] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isWorking ? 'Retrying…' : `Retry processing${retryCount ? ` (${retryCount}/${MAX_CLIENT_RETRIES})` : ''}`}
+              </button>
+              <button
+                type="button"
+                disabled={isWorking}
+                onClick={() => {
+                  setStatus('upload')
+                  setError('')
+                  setReceipt(null)
+                  setFile(null)
+                  setRetryCount(0)
+                  window.history.replaceState({}, '', '/admin/stock-receipt')
+                }}
+                className="rounded-xl border border-[#d9e7f0] bg-white px-5 py-3 font-bold text-[#18527f] dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+              >
+                Upload a different file
+              </button>
+              <a href="/admin/receipts" className="rounded-xl px-5 py-3 font-bold text-[#2f80c0]">Back to receipts</a>
+            </div>
           </section>
         )}
 
@@ -424,9 +629,13 @@ export default function ReceiptStockPage() {
 
         {!bootstrapping && status === 'success' && result && (
           <section className="mt-8 rounded-3xl border border-[#b9e5ca] bg-white p-6 shadow-lg dark:border-[#3b8c5a] dark:bg-[#172b3d]">
-            <h2 className="text-2xl font-extrabold text-[#17683b]">Stock updated successfully</h2>
+            <h2 className="text-2xl font-extrabold text-[#17683b]">
+              {result.alreadyConfirmed ? 'Receipt already confirmed' : 'Stock updated successfully'}
+            </h2>
             <p className="mt-2 text-[#607487] dark:text-slate-300">
-              {result.updated.length} medicine{result.updated.length === 1 ? '' : 's'} updated.
+              {result.alreadyConfirmed
+                ? 'This receipt was confirmed earlier. Stock was not changed again.'
+                : `${result.updated.length} medicine${result.updated.length === 1 ? '' : 's'} updated.`}
               {typeof result.expiringItemCount === 'number' && result.expiringItemCount > 0
                 ? ` ${result.expiringItemCount} confirmed item(s) expire within the warning window.`
                 : ''}

@@ -725,6 +725,43 @@ const extractReceiptItems = async (file) => {
 	return extractReceiptItemsWithTesseract(file);
 };
 
+/** In-flight process locks for this serverless isolate (prevents duplicate simultaneous OCR). */
+const receiptProcessingLocks = globalThis.__pharmacyReceiptProcessingLocks || new Set();
+if (process.env.NODE_ENV !== 'production') {
+	globalThis.__pharmacyReceiptProcessingLocks = receiptProcessingLocks;
+}
+
+const MAX_RECEIPT_PROCESS_RETRIES = Number.parseInt(process.env.RECEIPT_MAX_PROCESS_RETRIES, 10) || 5;
+
+const sanitizeReceiptErrorMessage = (message) => {
+	const text = String(message || 'Receipt processing failed. Please try again.').replace(/\s+/g, ' ').trim();
+	if (/timeout|RECEIPT_OCR_TIMEOUT|504/i.test(text)) return 'Receipt processing timed out. Please retry.';
+	if (/scanned\/image-only pdf|little readable text/i.test(text)) {
+		return 'Scanned/image-only PDF is not currently supported. Please upload the receipt as JPG or PNG.';
+	}
+	if (/could not read|empty|corrupt|invalid pdf|unreadable|clearer/i.test(text)) {
+		return 'Could not read this receipt. Please upload a clearer JPG or PNG.';
+	}
+	if (/OCR|tesseract|AI processing|DOMMatrix|pdf-parse|pdfjs/i.test(text)) {
+		return 'AI processing failed. Please retry.';
+	}
+	return text.slice(0, 280);
+};
+
+const logReceiptProcessStep = (step, startedAt, extra = {}) => {
+	console.info('[receipt-process]', { step, elapsedMs: Date.now() - startedAt, ...extra });
+};
+
+const markReceiptFailed = async (receiptId, message) => {
+	const adminMessage = sanitizeReceiptErrorMessage(message);
+	await prisma.$executeRaw(Prisma.sql`
+		UPDATE "StockReceipt"
+		SET "status" = 'FAILED', "errorMessage" = ${adminMessage}
+		WHERE "id" = ${receiptId} AND "status" <> 'CONFIRMED'
+	`);
+	return adminMessage;
+};
+
 const getReceiptDetails = async (receiptId) => {
 	const receipts = await prisma.$queryRaw(Prisma.sql`SELECT "id", "fileName", "mimeType", "status", "uploadedBy", "uploadedAt", "processedAt", "confirmedBy", "confirmedAt", "errorMessage" FROM "StockReceipt" WHERE "id" = ${receiptId}`);
 	if (receipts.length === 0) return null;
@@ -850,22 +887,117 @@ app.post('/api/stock/receipt/upload', requireAdmin, requireStockSchema, receiveR
 	}
 });
 
-app.post('/api/stock/receipt/process', requireAdmin, requireStockSchema, rateLimit('receipt-process', 5, 60_000), async (req, res) => {
-	const receiptId = typeof req.body?.receiptId === 'string' ? req.body.receiptId : '';
-	if (!receiptId) return res.status(400).json({ error: 'receiptId is required' });
+const runReceiptProcessing = async (receiptId, { allowReadyPassthrough = true } = {}) => {
+	if (receiptProcessingLocks.has(receiptId)) {
+		const error = new Error('This receipt is already being processed. Please wait.');
+		error.statusCode = 409;
+		error.receiptStatus = 'PROCESSING';
+		throw error;
+	}
+
+	const startedAt = Date.now();
+	receiptProcessingLocks.add(receiptId);
+	logReceiptProcessStep('request_received', startedAt, { receiptId });
+
 	try {
-		const receipts = await prisma.$queryRaw(Prisma.sql`SELECT "id", "fileName", "mimeType", "fileData", "status" FROM "StockReceipt" WHERE "id" = ${receiptId}`);
-		if (receipts.length === 0) return res.status(404).json({ error: 'Receipt not found' });
+		const retrieveStartedAt = Date.now();
+		const receipts = await prisma.$queryRaw(Prisma.sql`
+			SELECT "id", "fileName", "mimeType", "fileData", "status", "errorMessage"
+			FROM "StockReceipt" WHERE "id" = ${receiptId}
+		`);
+		logReceiptProcessStep('receipt_retrieval', retrieveStartedAt, { receiptId, found: receipts.length > 0 });
+		if (receipts.length === 0) {
+			const error = new Error('Receipt not found');
+			error.statusCode = 404;
+			throw error;
+		}
+
 		const receipt = receipts[0];
-		if (receipt.status === 'CONFIRMED') return res.status(409).json({ error: 'This receipt has already been confirmed' });
+		if (receipt.status === 'CONFIRMED') {
+			const error = new Error('This receipt has already been confirmed');
+			error.statusCode = 409;
+			error.receiptStatus = 'CONFIRMED';
+			throw error;
+		}
+		if (receipt.status === 'READY_FOR_REVIEW') {
+			if (allowReadyPassthrough) {
+				logReceiptProcessStep('already_ready', startedAt, { receiptId });
+				return getReceiptDetails(receiptId);
+			}
+			const error = new Error('Receipt is already ready for review');
+			error.statusCode = 409;
+			error.receiptStatus = 'READY_FOR_REVIEW';
+			throw error;
+		}
+		if (!['PROCESSING', 'FAILED'].includes(receipt.status)) {
+			const error = new Error(`Receipt cannot be processed from status ${receipt.status}`);
+			error.statusCode = 409;
+			error.receiptStatus = receipt.status;
+			throw error;
+		}
+
+		await prisma.$executeRaw(Prisma.sql`
+			UPDATE "StockReceipt"
+			SET "status" = 'PROCESSING', "errorMessage" = NULL
+			WHERE "id" = ${receiptId} AND "status" IN ('PROCESSING', 'FAILED')
+		`);
+		logReceiptProcessStep('status_claimed', startedAt, { receiptId, previousStatus: receipt.status });
+
+		const fileRetrieveStartedAt = Date.now();
 		const fileData = receipt.fileData;
-		const fileBuffer = Buffer.isBuffer(fileData) ? fileData : Buffer.from(fileData);
-		const extractedItems = await extractReceiptItems({ buffer: fileBuffer, mimetype: receipt.mimeType, originalname: receipt.fileName });
+		const fileBuffer = Buffer.isBuffer(fileData) ? fileData : Buffer.from(fileData || []);
+		logReceiptProcessStep('file_retrieval', fileRetrieveStartedAt, {
+			receiptId,
+			mimeType: receipt.mimeType,
+			byteLength: fileBuffer.length,
+		});
+		if (!fileBuffer.length) {
+			const adminMessage = await markReceiptFailed(receiptId, 'Could not read this receipt. Please upload a clearer JPG or PNG.');
+			const error = new Error(adminMessage);
+			error.statusCode = 422;
+			error.receiptStatus = 'FAILED';
+			throw error;
+		}
+
+		const typeDetectStartedAt = Date.now();
+		const isPdf = receipt.mimeType === 'application/pdf';
+		const isImage = receipt.mimeType === 'image/jpeg' || receipt.mimeType === 'image/png';
+		logReceiptProcessStep('file_type_detection', typeDetectStartedAt, {
+			receiptId,
+			mimeType: receipt.mimeType,
+			path: isPdf ? 'pdf' : isImage ? 'image_ocr' : 'unknown',
+		});
+		if (!isPdf && !isImage) {
+			const adminMessage = await markReceiptFailed(receiptId, 'Could not read this receipt. Please upload a clearer JPG or PNG.');
+			const error = new Error(adminMessage);
+			error.statusCode = 422;
+			error.receiptStatus = 'FAILED';
+			throw error;
+		}
+
+		const ocrStartedAt = Date.now();
+		const extractedItems = await extractReceiptItems({
+			buffer: fileBuffer,
+			mimetype: receipt.mimeType,
+			originalname: receipt.fileName,
+		});
+		logReceiptProcessStep(isPdf ? 'pdf_parsing' : 'image_ocr_ai', ocrStartedAt, {
+			receiptId,
+			itemCount: extractedItems.length,
+		});
+
+		const matchStartedAt = Date.now();
 		const matchedItems = [];
 		for (const extractedItem of extractedItems) {
 			const match = await matchReceiptItemAgainstDatabase(extractedItem);
 			matchedItems.push({ extractedItem, match });
 		}
+		logReceiptProcessStep('medicine_candidate_matching', matchStartedAt, {
+			receiptId,
+			itemCount: matchedItems.length,
+		});
+
+		const dbUpdateStartedAt = Date.now();
 		await prisma.$transaction(async (tx) => {
 			await tx.$executeRaw(Prisma.sql`DELETE FROM "StockReceiptItem" WHERE "receiptId" = ${receiptId}`);
 			for (const { extractedItem, match } of matchedItems) {
@@ -876,22 +1008,84 @@ app.post('/api/stock/receipt/process', requireAdmin, requireStockSchema, rateLim
 					VALUES (${crypto.randomUUID()}, ${receiptId}, ${String(extractedItem.medicine_name || 'Unidentified item').trim()}, ${extractedItem.brand_name || null}, ${extractedItem.generic_name || null}, ${extractedItem.strength || null}, ${extractedItem.dosage_form || null}, ${extractedItem.pack_size || null}, ${quantity}, ${Number.isFinite(Number(extractedItem.unit_price)) ? Number(extractedItem.unit_price) : null}, ${Number.isFinite(Number(extractedItem.total_price)) ? Number(extractedItem.total_price) : null}, ${extractedItem.batch_number || null}, ${extractedItem.expiry_date || null}, ${confidence}, ${match.matchStatus}, ${match.matchedMedicineId})
 				`);
 			}
-			await tx.$executeRaw(Prisma.sql`UPDATE "StockReceipt" SET "status" = 'READY_FOR_REVIEW', "processedAt" = NOW(), "errorMessage" = NULL WHERE "id" = ${receiptId}`);
+			await tx.$executeRaw(Prisma.sql`
+				UPDATE "StockReceipt"
+				SET "status" = 'READY_FOR_REVIEW', "processedAt" = NOW(), "errorMessage" = NULL
+				WHERE "id" = ${receiptId} AND "status" = 'PROCESSING'
+			`);
 		});
-		res.json(await getReceiptDetails(receiptId));
+		logReceiptProcessStep('database_update', dbUpdateStartedAt, { receiptId, status: 'READY_FOR_REVIEW' });
+		logReceiptProcessStep('final_response', startedAt, { receiptId, status: 'READY_FOR_REVIEW' });
+		return getReceiptDetails(receiptId);
 	} catch (error) {
-		const adminMessage = error.message || 'Receipt processing failed';
-		try {
-			await prisma.$executeRaw(Prisma.sql`UPDATE "StockReceipt" SET "status" = 'FAILED', "errorMessage" = ${adminMessage} WHERE "id" = ${receiptId}`);
-		} catch (updateError) {
-			console.error('Could not mark receipt processing failure:', updateError);
+		const alreadyFailed = error.receiptStatus === 'FAILED' && error.statusCode && error.statusCode !== 500;
+		const shouldPersistFailure = !['CONFIRMED', 'READY_FOR_REVIEW'].includes(error.receiptStatus)
+			&& error.statusCode !== 404
+			&& error.statusCode !== 409;
+		if (shouldPersistFailure && !alreadyFailed) {
+			try {
+				await markReceiptFailed(receiptId, error.message || 'Receipt processing failed. Please try again.');
+				error.receiptStatus = 'FAILED';
+			} catch (updateError) {
+				console.error('Could not mark receipt processing failure:', updateError);
+			}
 		}
-		const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 500;
-		if (statusCode >= 400 && statusCode < 600 && statusCode !== 500) {
-			return res.status(statusCode).json({ error: adminMessage, receiptId, status: 'FAILED' });
+		if (!error.statusCode || error.statusCode === 500) {
+			logReceiptProcessStep('failed', startedAt, {
+				receiptId,
+				statusCode: error.statusCode || 500,
+				code: error.code || null,
+			});
 		}
-		console.error('Receipt process failed:', error);
-		return res.status(500).json({ error: adminMessage, receiptId, status: 'FAILED' });
+		throw error;
+	} finally {
+		receiptProcessingLocks.delete(receiptId);
+	}
+};
+
+const sendReceiptProcessError = (res, receiptId, error) => {
+	const adminMessage = sanitizeReceiptErrorMessage(error.message || 'Receipt processing failed. Please try again.');
+	const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 500;
+	const status = error.receiptStatus || (statusCode === 409 ? undefined : 'FAILED');
+	if (statusCode >= 400 && statusCode < 600 && statusCode !== 500) {
+		return res.status(statusCode).json({ error: adminMessage, receiptId, status });
+	}
+	console.error('Receipt process failed:', error.code || error.message || error);
+	return res.status(500).json({ error: adminMessage, receiptId, status: 'FAILED' });
+};
+
+app.post('/api/stock/receipt/process', requireAdmin, requireStockSchema, rateLimit('receipt-process', MAX_RECEIPT_PROCESS_RETRIES, 60_000), async (req, res) => {
+	const receiptId = typeof req.body?.receiptId === 'string' ? req.body.receiptId.trim() : '';
+	if (!receiptId) return res.status(400).json({ error: 'receiptId is required' });
+	try {
+		res.json(await runReceiptProcessing(receiptId, { allowReadyPassthrough: true }));
+	} catch (error) {
+		return sendReceiptProcessError(res, receiptId, error);
+	}
+});
+
+app.post('/api/stock/receipt/retry', requireAdmin, requireStockSchema, rateLimit('receipt-retry', MAX_RECEIPT_PROCESS_RETRIES, 60_000), async (req, res) => {
+	const receiptId = typeof req.body?.receiptId === 'string' ? req.body.receiptId.trim() : '';
+	if (!receiptId) return res.status(400).json({ error: 'receiptId is required' });
+	try {
+		const receipts = await prisma.$queryRaw(Prisma.sql`
+			SELECT "id", "status" FROM "StockReceipt" WHERE "id" = ${receiptId}
+		`);
+		if (receipts.length === 0) return res.status(404).json({ error: 'Receipt not found' });
+		const receipt = receipts[0];
+		if (receipt.status === 'CONFIRMED') {
+			return res.status(409).json({ error: 'Confirmed receipts cannot be reprocessed', receiptId, status: 'CONFIRMED' });
+		}
+		if (receipt.status !== 'FAILED') {
+			return res.status(409).json({
+				error: 'Only failed receipts can be retried',
+				receiptId,
+				status: receipt.status,
+			});
+		}
+		res.json(await runReceiptProcessing(receiptId, { allowReadyPassthrough: false }));
+	} catch (error) {
+		return sendReceiptProcessError(res, receiptId, error);
 	}
 });
 
@@ -1478,6 +1672,51 @@ app.get('/api/admin/receipts', requireAdmin, requireStockSchema, async (req, res
 				ORDER BY "uploadedAt" DESC LIMIT ${limit} OFFSET ${offset}
 			`);
 		res.json(serializeDatabaseValue(rows));
+	} catch (error) {
+		next(error);
+	}
+});
+
+/**
+ * Delete a non-confirmed receipt.
+ * File bytes live in StockReceipt.fileData (no external blob). Cascade removes items.
+ * CONFIRMED receipts are retained for audit/history (StockTransaction FK is RESTRICT).
+ */
+app.delete('/api/admin/receipts/:id', requireAdmin, requireStockSchema, async (req, res, next) => {
+	const receiptId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+	if (!receiptId) return res.status(400).json({ error: 'Receipt id is required' });
+	if (receiptProcessingLocks.has(receiptId)) {
+		return res.status(409).json({ error: 'This receipt is being processed and cannot be deleted right now.', receiptId });
+	}
+	try {
+		const receipts = await prisma.$queryRaw(Prisma.sql`
+			SELECT "id", "fileName", "status" FROM "StockReceipt" WHERE "id" = ${receiptId}
+		`);
+		if (receipts.length === 0) {
+			return res.status(404).json({ error: 'Receipt not found or already deleted' });
+		}
+		const receipt = receipts[0];
+		if (receipt.status === 'CONFIRMED') {
+			return res.status(409).json({
+				error: 'Confirmed receipts are retained for audit/history and cannot be deleted.',
+				receiptId,
+				status: 'CONFIRMED',
+			});
+		}
+
+		// fileData is stored in-row; deleting the row removes the uploaded bytes.
+		await prisma.$executeRaw(Prisma.sql`DELETE FROM "StockReceipt" WHERE "id" = ${receiptId} AND "status" <> 'CONFIRMED'`);
+		const stillThere = await prisma.$queryRaw(Prisma.sql`SELECT "id" FROM "StockReceipt" WHERE "id" = ${receiptId}`);
+		if (stillThere.length > 0) {
+			return res.status(409).json({ error: 'Receipt could not be deleted. It may have been confirmed.', receiptId });
+		}
+		res.json({
+			ok: true,
+			deleted: true,
+			receiptId,
+			fileName: receipt.fileName,
+			previousStatus: receipt.status,
+		});
 	} catch (error) {
 		next(error);
 	}
