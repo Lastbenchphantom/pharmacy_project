@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { sendChat } from '../api'
 
 const quickPrompts = [
   'How do I manage fever at home?',
@@ -10,7 +11,15 @@ const botResponses = {
   fever: 'Rest, hydrate, and monitor your temperature. If fever lasts more than 3 days or you have breathing difficulty, seek medical attention promptly.',
   vitamin: 'A balanced diet with vitamin D, B12, and iron often helps. If you have a specific deficiency, a clinician can recommend the right supplement.',
   refill: 'Try to refill 5–7 days before your current stock runs out, especially for recurring prescriptions or chronic conditions.',
-  default: 'For personal health issues, our clinicians can guide you best. Please book an appointment for a tailored care plan.'
+  default: 'For personal health issues, our clinicians can guide you best. Please book an appointment for a tailored care plan.',
+}
+
+const localReply = (question) => {
+  const text = question.toLowerCase()
+  if (text.includes('fever') || text.includes('flu')) return botResponses.fever
+  if (text.includes('vitamin') || text.includes('supplement')) return botResponses.vitamin
+  if (text.includes('refill') || text.includes('prescription')) return botResponses.refill
+  return botResponses.default
 }
 
 export default function AiChatbot() {
@@ -22,28 +31,29 @@ export default function AiChatbot() {
     },
   ])
   const [input, setInput] = useState('')
+  const [isSending, setIsSending] = useState(false)
 
-  const getReply = (question) => {
-    const text = question.toLowerCase()
-
-    if (text.includes('fever') || text.includes('flu')) return botResponses.fever
-    if (text.includes('vitamin') || text.includes('supplement')) return botResponses.vitamin
-    if (text.includes('refill') || text.includes('prescription')) return botResponses.refill
-
-    return botResponses.default
-  }
-
-  const handleSubmit = (event) => {
+  const handleSubmit = async (event) => {
     event.preventDefault()
-
-    if (!input.trim()) return
+    if (!input.trim() || isSending) return
 
     const question = input.trim()
     const nextUserMessage = { id: Date.now(), sender: 'user', text: question }
-    const nextBotMessage = { id: Date.now() + 1, sender: 'bot', text: getReply(question) }
-
-    setMessages((current) => [...current, nextUserMessage, nextBotMessage])
+    setMessages((current) => [...current, nextUserMessage])
     setInput('')
+    setIsSending(true)
+
+    try {
+      const result = await sendChat(question)
+      const reply = typeof result.response === 'string' && result.response.trim()
+        ? result.response.trim()
+        : localReply(question)
+      setMessages((current) => [...current, { id: Date.now() + 1, sender: 'bot', text: reply }])
+    } catch {
+      setMessages((current) => [...current, { id: Date.now() + 1, sender: 'bot', text: localReply(question) }])
+    } finally {
+      setIsSending(false)
+    }
   }
 
   return (
@@ -57,6 +67,9 @@ export default function AiChatbot() {
             {message.text}
           </div>
         ))}
+        {isSending && (
+          <div className="max-w-[80%] rounded-2xl bg-[#e7f4fc] px-4 py-3 text-sm text-[#607487] dark:bg-slate-800">Thinking…</div>
+        )}
       </div>
 
       <div className="mt-4 flex flex-wrap gap-2">
@@ -81,8 +94,8 @@ export default function AiChatbot() {
           aria-label="Ask Apollo AI"
           className="flex-1 rounded-xl border border-[#d9e7f0] bg-[#f4f9fc] px-4 py-3 text-[#172b3d] outline-none focus:ring-2 focus:ring-[#2f80c0] dark:border-slate-600 dark:bg-slate-800 dark:text-white"
         />
-        <button type="submit" className="rounded-xl bg-[#2f80c0] px-5 py-3 font-bold text-white transition hover:bg-[#18527f]">
-          Send
+        <button type="submit" disabled={isSending} className="rounded-xl bg-[#2f80c0] px-5 py-3 font-bold text-white transition hover:bg-[#18527f] disabled:opacity-60">
+          {isSending ? 'Sending…' : 'Send'}
         </button>
       </form>
     </div>

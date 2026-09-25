@@ -21,8 +21,13 @@ model Medicine {
 	createdAt     DateTime @default(now())
 	updatedAt     DateTime @updatedAt
 
+	batches            StockBatch[]
+	stockTransactions  StockTransaction[]
+	receiptItems       StockReceiptItem[]
+
 	@@index([brandName])
 	@@index([genericName])
+	@@index([availableQty])
 }
 
 model Appointment {
@@ -79,7 +84,8 @@ model StockReceiptItem {
 	matchStatus    String   @default("UNMATCHED")
 	matchedMedicineId String?
 
-	receipt        StockReceipt @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+	receipt          StockReceipt @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+	matchedMedicine  Medicine?    @relation(fields: [matchedMedicineId], references: [id], onDelete: SetNull)
 
 	@@index([receiptId])
 	@@index([matchedMedicineId])
@@ -87,7 +93,7 @@ model StockReceiptItem {
 
 model StockTransaction {
 	id             String   @id @default(cuid())
-	receiptId      String
+	receiptId      String?
 	medicineId     String
 	transactionType String
 	quantity       Int
@@ -95,12 +101,42 @@ model StockTransaction {
 	newStock       Int
 	batchNumber    String?
 	expiryDate     String?
+	reason         String?
 	createdBy      String
 	createdAt      DateTime @default(now())
 
-	receipt        StockReceipt @relation(fields: [receiptId], references: [id], onDelete: Restrict)
+	receipt        StockReceipt? @relation(fields: [receiptId], references: [id], onDelete: Restrict)
+	medicine       Medicine      @relation(fields: [medicineId], references: [id], onDelete: Restrict)
 
 	@@index([medicineId, createdAt])
 	@@index([receiptId])
+	@@index([transactionType, createdAt])
 }
 
+model StockBatch {
+	id           String    @id @default(cuid())
+	medicineId   String
+	batchNumber  String?
+	expiryDate   DateTime?
+	quantity     Int       @default(0)
+	createdAt    DateTime  @default(now())
+	updatedAt    DateTime  @updatedAt
+	medicine     Medicine  @relation(fields: [medicineId], references: [id], onDelete: Cascade)
+
+	@@unique([medicineId, batchNumber])
+	@@index([expiryDate])
+	@@index([medicineId, expiryDate])
+}
+
+model PushSubscription {
+	id        String   @id @default(cuid())
+	endpoint  String   @unique
+	p256dh    String
+	auth      String
+	userAgent String?
+	createdBy String?
+	createdAt DateTime @default(now())
+	updatedAt DateTime @updatedAt
+
+	@@index([createdAt])
+}

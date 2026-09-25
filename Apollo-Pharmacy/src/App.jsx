@@ -5,6 +5,8 @@ import AiChatbot from './components/AiChatbot'
 import AdminPage from './components/AdminPage'
 import MedicinePage from './components/MedicinePage'
 import ReceiptStockPage from './components/ReceiptStockPage'
+import StockHistoryPage from './components/StockHistoryPage'
+import ReceiptListPage from './components/ReceiptListPage'
 import { getMedicines } from './api'
 
 const services = [
@@ -198,6 +200,8 @@ function PublicApp() {
 export default function App() {
   if (window.location.pathname === '/admin') return <AdminPage />
   if (window.location.pathname === '/admin/stock-receipt') return <ReceiptStockPage />
+  if (window.location.pathname === '/admin/stock-history') return <StockHistoryPage />
+  if (window.location.pathname === '/admin/receipts') return <ReceiptListPage />
   if (window.location.pathname === '/medicines') return <MedicinePage />
   return <PublicApp />
 }
