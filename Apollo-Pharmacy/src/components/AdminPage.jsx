@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
-  getAdminAppointments,
   getDashboard,
   getExpiringStock,
   getLowStock,
@@ -8,7 +7,6 @@ import {
   loginAdmin,
   sendExpiryAlertEmail,
   syncMedicines,
-  updateAppointmentStatus,
 } from '../api'
 import DashboardStats from './DashboardStats'
 import LowStockTable from './LowStockTable'
@@ -45,7 +43,7 @@ function AdminLogin({ onLogin }) {
         <a href="/" className="text-sm font-bold text-[#2f80c0]">← Back to pharmacy</a>
         <p className="mt-8 text-xs font-bold uppercase tracking-[.12em] text-[#2f80c0]">Staff portal</p>
         <h1 className="mt-2 text-4xl font-extrabold">Admin sign in</h1>
-        <p className="mt-3 text-[#607487] dark:text-slate-300">Control stock, expiry, receipts, and appointments.</p>
+        <p className="mt-3 text-[#607487] dark:text-slate-300">Control stock, expiry, and receipt imports.</p>
         <label className="mt-8 block text-sm font-bold" htmlFor="admin-password">Admin password</label>
         <input
           id="admin-password"
@@ -70,8 +68,6 @@ function AdminDashboard({ token, onLogout }) {
   const [lowStock, setLowStock] = useState([])
   const [expiring, setExpiring] = useState([])
   const [medicines, setMedicines] = useState([])
-  const [appointments, setAppointments] = useState([])
-  const [appointmentFilter, setAppointmentFilter] = useState('ALL')
   const [medicineSearch, setMedicineSearch] = useState('')
   const [submittedSearch, setSubmittedSearch] = useState('')
   const [suggestions, setSuggestions] = useState([])
@@ -97,6 +93,7 @@ function AdminDashboard({ token, onLogout }) {
       getExpiringStock(token, { includeExpired: true, limit: 20 }),
     ])
     if (dashboardResult.status === 'fulfilled') setStats(dashboardResult.value)
+    else if (dashboardResult.reason?.message) showError(dashboardResult.reason.message)
     if (lowResult.status === 'fulfilled') setLowStock(lowResult.value)
     if (expiringResult.status === 'fulfilled') setExpiring(expiringResult.value)
     const authFail = [dashboardResult, lowResult, expiringResult].find((result) => (
@@ -104,12 +101,6 @@ function AdminDashboard({ token, onLogout }) {
     ))
     if (authFail) onLogout()
   }, [token, onLogout])
-
-  const loadAppointments = useCallback(async (status = appointmentFilter) => {
-    const query = status === 'ALL' ? {} : { status }
-    const data = await getAdminAppointments(token, { ...query, limit: 50 })
-    setAppointments(data)
-  }, [token, appointmentFilter])
 
   const searchCatalog = async (search) => {
     const medicineData = await getMedicines({ limit: 20, search })
@@ -120,15 +111,16 @@ function AdminDashboard({ token, onLogout }) {
     Promise.allSettled([
       refreshAlerts(),
       getMedicines({ limit: 10 }),
-      getAdminAppointments(token, { limit: 50 }),
-    ]).then(([alertsResult, medicineResult, appointmentResult]) => {
+    ]).then(([alertsResult, medicineResult]) => {
       if (medicineResult.status === 'fulfilled') setMedicines(medicineResult.value)
-      if (appointmentResult.status === 'fulfilled') setAppointments(appointmentResult.value)
-      const failed = [alertsResult, medicineResult, appointmentResult].find((result) => result.status === 'rejected')
-      if (failed) {
-        const message = failed.reason.message || 'Failed to load admin data'
+      else if (medicineResult.status === 'rejected') {
+        const message = medicineResult.reason.message || 'Failed to load medicines'
         if (message.includes('session') || message.includes('login')) onLogout()
         else showError(message)
+      }
+      if (alertsResult.status === 'rejected') {
+        const message = alertsResult.reason?.message || 'Failed to load admin alerts'
+        if (message.includes('session') || message.includes('login')) onLogout()
       }
     }).finally(() => setIsLoading(false))
   }, [token, onLogout, refreshAlerts])
@@ -169,25 +161,6 @@ function AdminDashboard({ token, onLogout }) {
     }
   }
 
-  const changeAppointment = async (id, status) => {
-    if (status === 'REJECTED' && !window.confirm('Reject this appointment?')) return
-    try {
-      const updated = await updateAppointmentStatus(token, id, status)
-      setAppointments((current) => current.map((appointment) => (appointment.id === updated.id ? updated : appointment)))
-      await refreshAlerts()
-      const notificationMessage = updated.notificationReason === 'sent'
-        ? ' Notification email sent.'
-        : updated.notificationReason === 'missing-email'
-          ? ' This appointment has no email address.'
-          : updated.notificationReason === 'delivery-failed'
-            ? ' Email delivery failed.'
-            : ' Status saved (email not configured).'
-      showSuccess(`Appointment ${status.toLowerCase()}.${notificationMessage}`)
-    } catch (appointmentError) {
-      showError(appointmentError.message)
-    }
-  }
-
   const importCatalog = async () => {
     try {
       const result = await syncMedicines(token)
@@ -208,15 +181,6 @@ function AdminDashboard({ token, onLogout }) {
     }
   }
 
-  const filterAppointments = async (status) => {
-    setAppointmentFilter(status)
-    try {
-      await loadAppointments(status)
-    } catch (filterError) {
-      showError(filterError.message)
-    }
-  }
-
   const visibleSuggestions = medicineSearch.trim().length >= 2 && medicineSearch.trim() !== submittedSearch
     ? suggestions
     : []
@@ -231,7 +195,7 @@ function AdminDashboard({ token, onLogout }) {
         <header className="flex flex-wrap items-center justify-between gap-4">
           <div>
             <h1 className="text-4xl font-extrabold">Pharmacy operations</h1>
-            <p className="mt-1 text-sm text-[#607487]">Admin-first stock, expiry, receipts, and appointments</p>
+            <p className="mt-1 text-sm text-[#607487]">Admin-first stock, expiry, and receipt processing</p>
           </div>
           <nav className="flex flex-wrap gap-2">
             <a href="/" className="rounded-xl border border-[#d9e7f0] bg-white px-4 py-2 text-sm font-bold dark:border-slate-700 dark:bg-[#172b3d]">Public site</a>
@@ -291,79 +255,45 @@ function AdminDashboard({ token, onLogout }) {
           />
         </div>
 
-        <section className="mt-8 grid gap-6 lg:grid-cols-[1.2fr_.8fr]">
-          <div className="rounded-3xl border border-[#d9e7f0] bg-white p-5 dark:border-slate-700 dark:bg-[#172b3d]">
-            <h2 className="text-2xl font-extrabold">Live stock search</h2>
-            <p className="mt-1 text-sm text-[#607487]">Adjust stock with reason + expiry when adding. Edit metadata separately.</p>
-            <form onSubmit={searchMedicines} className="relative mt-5 flex gap-2">
-              <label className="sr-only" htmlFor="medicine-search">Search medicines</label>
-              <input
-                id="medicine-search"
-                className="min-w-0 flex-1 rounded-xl border border-[#d9e7f0] bg-[#f4f9fc] px-4 py-3 text-[#172b3d] outline-none focus:ring-2 focus:ring-[#2f80c0] dark:border-slate-600 dark:bg-slate-800 dark:text-white"
-                value={medicineSearch}
-                onChange={(event) => setMedicineSearch(event.target.value)}
-                placeholder="Search brand, generic, or manufacturer"
-              />
-              <button type="submit" className="rounded-xl bg-[#2f80c0] px-4 py-3 text-sm font-bold text-white hover:bg-[#18527f]">Search</button>
-              {visibleSuggestions.length > 0 && (
-                <div className="absolute left-0 right-[92px] top-full z-10 mt-2 overflow-hidden rounded-xl border border-[#d9e7f0] bg-white shadow-xl dark:border-slate-600 dark:bg-[#172b3d]">
-                  {visibleSuggestions.map((medicine) => (
-                    <button key={medicine.id} type="button" onClick={() => selectSuggestion(medicine)} className="block w-full border-b border-[#d9e7f0] px-4 py-3 text-left last:border-0 hover:bg-[#e7f4fc] dark:border-slate-700 dark:hover:bg-slate-700">
-                      <strong className="block text-sm dark:text-white">{medicine.brandName}</strong>
-                      <span className="text-xs text-[#607487] dark:text-slate-300">{medicine.genericName} · {medicine.strength}</span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </form>
-            <div className="mt-5 max-h-[55vh] overflow-y-auto pr-2">
-              <div className="grid gap-3">
-                {medicines.length === 0 && <p className="rounded-xl bg-[#f4f9fc] p-4 text-[#607487] dark:bg-slate-800">No medicines found.</p>}
-                {medicines.map((medicine) => (
-                  <div key={medicine.id} className="flex flex-wrap items-end justify-between gap-3 rounded-2xl bg-[#f4f9fc] p-3 dark:bg-slate-800">
-                    <div>
-                      <strong className="block">{medicine.brandName}</strong>
-                      <span className="text-sm text-[#607487]">{medicine.genericName} · {medicine.strength}</span>
-                      <p className="mt-1 text-sm font-bold">Qty {medicine.availableQty} · Piece {medicine.singlePiecePrice} · Box {medicine.fullBoxPrice}</p>
-                    </div>
-                    <div className="flex gap-2">
-                      <button type="button" onClick={() => setMedicineModal(medicine)} className="rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-sm font-bold dark:border-slate-600 dark:bg-[#172b3d]">Edit</button>
-                      <button type="button" onClick={() => setAdjustTarget({ medicine })} className="rounded-lg bg-[#2f80c0] px-3 py-2 text-sm font-bold text-white hover:bg-[#18527f]">Adjust stock</button>
-                    </div>
-                  </div>
+        <section className="mt-8 rounded-3xl border border-[#d9e7f0] bg-white p-5 dark:border-slate-700 dark:bg-[#172b3d]">
+          <h2 className="text-2xl font-extrabold">Live stock search</h2>
+          <p className="mt-1 text-sm text-[#607487]">Adjust stock with reason + expiry when adding. Edit metadata separately.</p>
+          <form onSubmit={searchMedicines} className="relative mt-5 flex gap-2">
+            <label className="sr-only" htmlFor="medicine-search">Search medicines</label>
+            <input
+              id="medicine-search"
+              className="min-w-0 flex-1 rounded-xl border border-[#d9e7f0] bg-[#f4f9fc] px-4 py-3 text-[#172b3d] outline-none focus:ring-2 focus:ring-[#2f80c0] dark:border-slate-600 dark:bg-slate-800 dark:text-white"
+              value={medicineSearch}
+              onChange={(event) => setMedicineSearch(event.target.value)}
+              placeholder="Search brand, generic, or manufacturer"
+            />
+            <button type="submit" className="rounded-xl bg-[#2f80c0] px-4 py-3 text-sm font-bold text-white hover:bg-[#18527f]">Search</button>
+            {visibleSuggestions.length > 0 && (
+              <div className="absolute left-0 right-[92px] top-full z-10 mt-2 overflow-hidden rounded-xl border border-[#d9e7f0] bg-white shadow-xl dark:border-slate-600 dark:bg-[#172b3d]">
+                {visibleSuggestions.map((medicine) => (
+                  <button key={medicine.id} type="button" onClick={() => selectSuggestion(medicine)} className="block w-full border-b border-[#d9e7f0] px-4 py-3 text-left last:border-0 hover:bg-[#e7f4fc] dark:border-slate-700 dark:hover:bg-slate-700">
+                    <strong className="block text-sm dark:text-white">{medicine.brandName}</strong>
+                    <span className="text-xs text-[#607487] dark:text-slate-300">{medicine.genericName} · {medicine.strength}</span>
+                  </button>
                 ))}
               </div>
-            </div>
-          </div>
-
-          <div className="rounded-3xl border border-[#d9e7f0] bg-white p-5 dark:border-slate-700 dark:bg-[#172b3d]">
-            <h2 className="text-2xl font-extrabold">Appointments</h2>
-            <div className="mt-4 flex flex-wrap gap-2">
-              {['ALL', 'PENDING', 'ACCEPTED', 'REJECTED'].map((status) => (
-                <button
-                  key={status}
-                  type="button"
-                  onClick={() => filterAppointments(status)}
-                  className={`rounded-lg px-3 py-1.5 text-xs font-bold ${appointmentFilter === status ? 'bg-[#2f80c0] text-white' : 'bg-[#e7f4fc] text-[#18527f] dark:bg-slate-700 dark:text-slate-200'}`}
-                >
-                  {status === 'ALL' ? 'All' : status.charAt(0) + status.slice(1).toLowerCase()}
-                </button>
-              ))}
-            </div>
-            <div className="mt-5 grid gap-3">
-              {appointments.length === 0 && <p className="text-[#607487]">No appointment requests yet.</p>}
-              {appointments.map((appointment) => (
-                <article key={appointment.id} className="rounded-2xl bg-[#f4f9fc] p-4 dark:bg-slate-800">
-                  <div className="flex items-start justify-between gap-3">
-                    <strong>{appointment.patientName}</strong>
-                    <span className="text-xs font-bold">{appointment.status}</span>
+            )}
+          </form>
+          <div className="mt-5 max-h-[55vh] overflow-y-auto pr-2">
+            <div className="grid gap-3">
+              {medicines.length === 0 && <p className="rounded-xl bg-[#f4f9fc] p-4 text-[#607487] dark:bg-slate-800">No medicines found.</p>}
+              {medicines.map((medicine) => (
+                <div key={medicine.id} className="flex flex-wrap items-end justify-between gap-3 rounded-2xl bg-[#f4f9fc] p-3 dark:bg-slate-800">
+                  <div>
+                    <strong className="block">{medicine.brandName}</strong>
+                    <span className="text-sm text-[#607487]">{medicine.genericName} · {medicine.strength}</span>
+                    <p className="mt-1 text-sm font-bold">Qty {medicine.availableQty} · Piece {medicine.singlePiecePrice} · Box {medicine.fullBoxPrice}</p>
                   </div>
-                  <p className="mt-2 text-sm text-[#607487]">{appointment.phoneNumber} · {appointment.doctorName} · {appointment.timeSlot}</p>
-                  <div className="mt-3 flex gap-2">
-                    <button type="button" onClick={() => changeAppointment(appointment.id, 'ACCEPTED')} className="rounded-lg bg-[#d9f3e6] px-3 py-2 text-xs font-bold text-[#17683b]">Accept</button>
-                    <button type="button" onClick={() => changeAppointment(appointment.id, 'REJECTED')} className="rounded-lg bg-[#fff0ef] px-3 py-2 text-xs font-bold text-[#b94f49]">Reject</button>
+                  <div className="flex gap-2">
+                    <button type="button" onClick={() => setMedicineModal(medicine)} className="rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-sm font-bold dark:border-slate-600 dark:bg-[#172b3d]">Edit</button>
+                    <button type="button" onClick={() => setAdjustTarget({ medicine })} className="rounded-lg bg-[#2f80c0] px-3 py-2 text-sm font-bold text-white hover:bg-[#18527f]">Adjust stock</button>
                   </div>
-                </article>
+                </div>
               ))}
             </div>
           </div>
@@ -381,7 +311,9 @@ function AdminDashboard({ token, onLogout }) {
               return exists ? current.map((item) => (item.id === saved.id ? saved : item)) : [saved, ...current]
             })
             await refreshAlerts()
-            showSuccess(medicineModal.id ? 'Medicine updated.' : 'Medicine created with zero stock.')
+            showSuccess(medicineModal.id
+              ? 'Medicine updated in the database.'
+              : `Medicine created${saved.availableQty > 0 ? ` with stock ${saved.availableQty}` : ''}.`)
           }}
         />
       )}
@@ -396,7 +328,7 @@ function AdminDashboard({ token, onLogout }) {
             await refreshAlerts()
             if (submittedSearch) await searchCatalog(submittedSearch)
             else setMedicines(await getMedicines({ limit: 10 }))
-            showSuccess('Stock updated.')
+            showSuccess('Stock synced with the database.')
           }}
         />
       )}

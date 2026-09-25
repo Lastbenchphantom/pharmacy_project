@@ -28,30 +28,15 @@ export const getMedicines = ({ limit, random = false, search = '', offset } = {}
   request(withQuery('/medicines', { limit, random: random ? 'true' : undefined, search, offset }))
 )
 
-export const createAppointment = (appointment) => request('/appointments', {
-  method: 'POST',
-  body: JSON.stringify(appointment),
-})
-
 export const loginAdmin = (password) => request('/admin/login', {
   method: 'POST',
   body: JSON.stringify({ password }),
 })
 
-export const getAdminAppointments = (token, { status, limit, offset } = {}) => (
-  request(withQuery('/admin/appointments', { status, limit, offset }), { token })
-)
-
 export const updateMedicineStock = (token, medicineId, stock) => request('/admin/update-stock', {
   method: 'PATCH',
   token,
   body: JSON.stringify({ medicineId, ...stock }),
-})
-
-export const updateAppointmentStatus = (token, appointmentId, status) => request(`/admin/appointments/${appointmentId}`, {
-  method: 'PATCH',
-  token,
-  body: JSON.stringify({ status }),
 })
 
 export const syncMedicines = (token) => request('/admin/medicines/sync', {

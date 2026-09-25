@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import MedicineCatalog from './components/MedicineCatalog'
-import AppointmentForm from './components/AppointmentForm'
 import AiChatbot from './components/AiChatbot'
 import AdminPage from './components/AdminPage'
 import MedicinePage from './components/MedicinePage'
@@ -30,7 +29,6 @@ const services = [
 
 function PublicApp() {
   const [inventory, setInventory] = useState([])
-  const [doctors, setDoctors] = useState([])
   const [catalogError, setCatalogError] = useState('')
   const [isDark, setIsDark] = useState(() => {
     if (typeof window === 'undefined') return false
@@ -56,16 +54,6 @@ function PublicApp() {
       .catch((error) => setCatalogError(error.message))
   }, [])
 
-  useEffect(() => {
-    fetch('/doctors.json')
-      .then((response) => {
-        if (!response.ok) throw new Error('Doctor schedules are unavailable.')
-        return response.json()
-      })
-      .then(setDoctors)
-      .catch((error) => setCatalogError(error.message))
-  }, [])
-
   return (
     <div className="min-h-screen bg-[#f4f9fc] px-4 py-6 text-[#172b3d] transition-colors dark:bg-[#101d2b] dark:text-slate-100 sm:px-8">
       <div className="mx-auto w-full max-w-[80vw] max-lg:max-w-[92vw] max-sm:max-w-none">
@@ -81,7 +69,6 @@ function PublicApp() {
         <nav className="flex flex-wrap items-center gap-4 text-sm text-[#607487] dark:text-slate-300" aria-label="Main navigation">
           <a className="transition-colors hover:text-[#2f80c0]" href="#services">Services</a>
           <a className="transition-colors hover:text-[#2f80c0]" href="#catalog">Medicine</a>
-          <a className="transition-colors hover:text-[#2f80c0]" href="#booking">Appointments</a>
           <a className="transition-colors hover:text-[#2f80c0]" href="#ai">AI Assistant</a>
           <a className="transition-colors hover:text-[#2f80c0]" href="/admin">Admin</a>
         </nav>
@@ -145,29 +132,6 @@ function PublicApp() {
           {inventory.length > 0 && <MedicineCatalog medicines={inventory} remoteSearch scrollable />}
         </section>
 
-        <section id="booking" className="space-y-5">
-          <div>
-            <p className="mb-2 text-xs font-bold uppercase tracking-[.12em] text-[#2f80c0]">Appointments</p>
-            <h2 className="text-4xl font-extrabold tracking-tight text-[#172b3d] dark:text-white max-sm:text-3xl">Schedule your consultation in minutes</h2>
-          </div>
-
-          <div className="grid grid-cols-[.9fr_1.1fr] items-start gap-5 max-lg:grid-cols-1">
-            <div className="rounded-3xl border border-[#d9e7f0] bg-gradient-to-b from-[#e7f4fc] to-white p-6 dark:border-slate-700 dark:from-[#1d3d58] dark:to-[#172b3d]">
-              {doctors.length === 0 ? <p className="text-[#607487]">Loading doctor schedules...</p> : doctors.map((doctor) => <article className="border-b border-[#d9e7f0] py-4 last:border-0 dark:border-slate-600" key={doctor.id}>
-                <h3 className="font-bold text-[#172b3d] dark:text-white">{doctor.name}</h3>
-                <p className="text-[#607487] dark:text-slate-300">{doctor.specialty}</p>
-                <p className="mt-2 text-sm text-[#607487] dark:text-slate-300">{doctor.qualifications.join(' · ')}</p>
-                <p className="mt-2 text-sm text-[#607487] dark:text-slate-300">Registration: {doctor.registrationNumber}</p>
-                <p className="mt-2 text-sm text-[#607487] dark:text-slate-300">Morning: {doctor.visitingHours.morning}</p>
-                <p className="text-sm text-[#607487] dark:text-slate-300">Evening: {doctor.visitingHours.evening}</p>
-                <p className="mt-2 text-sm text-[#607487] dark:text-slate-300">Contact: {doctor.contactNumbers.join(' · ')}</p>
-              </article>)}
-            </div>
-
-            <AppointmentForm doctors={doctors} />
-          </div>
-        </section>
-
         <section id="ai" className="space-y-5">
           <div>
             <p className="mb-2 text-xs font-bold uppercase tracking-[.12em] text-[#2f80c0]">Health assistant</p>
@@ -189,7 +153,7 @@ function PublicApp() {
         <div className="flex gap-5 text-white/85">
           <a href="#services">Services</a>
           <a href="#catalog">Catalog</a>
-          <a href="#booking">Book visit</a>
+          <a href="#ai">AI Assistant</a>
         </div>
       </footer>
       </div>

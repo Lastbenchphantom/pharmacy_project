@@ -11,7 +11,7 @@ const botResponses = {
   fever: 'Rest, hydrate, and monitor your temperature. If fever lasts more than 3 days or you have breathing difficulty, seek medical attention promptly.',
   vitamin: 'A balanced diet with vitamin D, B12, and iron often helps. If you have a specific deficiency, a clinician can recommend the right supplement.',
   refill: 'Try to refill 5–7 days before your current stock runs out, especially for recurring prescriptions or chronic conditions.',
-  default: 'For personal health issues, our clinicians can guide you best. Please book an appointment for a tailored care plan.',
+  default: 'For personal health questions, please speak with a licensed clinician. I can help with general wellness tips and pharmacy product questions.',
 }
 
 const localReply = (question) => {

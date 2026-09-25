@@ -12,7 +12,7 @@ const MAX_FILE_SIZE = 10 * 1024 * 1024
 
 const steps = [
   ['upload', '1. Upload Receipt'],
-  ['processing', '2. AI Processing'],
+  ['processing', '2. OCR Processing'],
   ['review', '3. Review and Confirm'],
   ['success', '4. Stock Updated'],
 ]

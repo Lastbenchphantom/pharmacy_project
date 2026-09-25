@@ -7,6 +7,7 @@ const cors = require('cors');
 const nodemailer = require('nodemailer');
 const webpush = require('web-push');
 const { Prisma, PrismaClient } = require('@prisma/client');
+const { extractReceiptItemsWithTesseract } = require('../receiptOcr');
 
 const app = express();
 const DEFAULT_MEDICINE_API_URL = 'https://huggingface.co/datasets/Mahadih534/all-Bangladeshi-medicines/raw/main/medicine.csv';
@@ -17,6 +18,144 @@ const prisma = globalThis.__pharmacyPrisma || new PrismaClient();
 if (process.env.NODE_ENV !== 'production') {
 	globalThis.__pharmacyPrisma = prisma;
 }
+
+/** Create missing stock/receipt tables when migrations were not applied on the remote DB. */
+let stockSchemaPromise = null;
+const ensureStockSchema = async () => {
+	if (!stockSchemaPromise) {
+		stockSchemaPromise = (async () => {
+			await prisma.$executeRawUnsafe(`
+				CREATE TABLE IF NOT EXISTS "StockReceipt" (
+					"id" TEXT NOT NULL,
+					"fileName" TEXT NOT NULL,
+					"mimeType" TEXT NOT NULL,
+					"fileHash" TEXT NOT NULL,
+					"fileData" BYTEA NOT NULL,
+					"status" TEXT NOT NULL DEFAULT 'PROCESSING',
+					"uploadedBy" TEXT NOT NULL,
+					"uploadedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+					"processedAt" TIMESTAMP(3),
+					"confirmedBy" TEXT,
+					"confirmedAt" TIMESTAMP(3),
+					"errorMessage" TEXT,
+					CONSTRAINT "StockReceipt_pkey" PRIMARY KEY ("id")
+				)
+			`);
+			await prisma.$executeRawUnsafe(`CREATE UNIQUE INDEX IF NOT EXISTS "StockReceipt_fileHash_key" ON "StockReceipt"("fileHash")`);
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "StockReceipt_status_uploadedAt_idx" ON "StockReceipt"("status", "uploadedAt")`);
+
+			await prisma.$executeRawUnsafe(`
+				CREATE TABLE IF NOT EXISTS "StockReceiptItem" (
+					"id" TEXT NOT NULL,
+					"receiptId" TEXT NOT NULL,
+					"medicineName" TEXT NOT NULL,
+					"brandName" TEXT,
+					"genericName" TEXT,
+					"strength" TEXT,
+					"dosageForm" TEXT,
+					"packSize" TEXT,
+					"quantity" INTEGER,
+					"unitPrice" DOUBLE PRECISION,
+					"totalPrice" DOUBLE PRECISION,
+					"batchNumber" TEXT,
+					"expiryDate" TEXT,
+					"confidence" DOUBLE PRECISION NOT NULL DEFAULT 0,
+					"matchStatus" TEXT NOT NULL DEFAULT 'UNMATCHED',
+					"matchedMedicineId" TEXT,
+					CONSTRAINT "StockReceiptItem_pkey" PRIMARY KEY ("id")
+				)
+			`);
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "StockReceiptItem_receiptId_idx" ON "StockReceiptItem"("receiptId")`);
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "StockReceiptItem_matchedMedicineId_idx" ON "StockReceiptItem"("matchedMedicineId")`);
+
+			await prisma.$executeRawUnsafe(`
+				CREATE TABLE IF NOT EXISTS "StockTransaction" (
+					"id" TEXT NOT NULL,
+					"receiptId" TEXT,
+					"medicineId" TEXT NOT NULL,
+					"transactionType" TEXT NOT NULL,
+					"quantity" INTEGER NOT NULL,
+					"previousStock" INTEGER NOT NULL,
+					"newStock" INTEGER NOT NULL,
+					"batchNumber" TEXT,
+					"expiryDate" TEXT,
+					"reason" TEXT,
+					"createdBy" TEXT NOT NULL,
+					"createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+					CONSTRAINT "StockTransaction_pkey" PRIMARY KEY ("id")
+				)
+			`);
+			await prisma.$executeRawUnsafe(`ALTER TABLE "StockTransaction" ALTER COLUMN "receiptId" DROP NOT NULL`).catch(() => {});
+			await prisma.$executeRawUnsafe(`ALTER TABLE "StockTransaction" ADD COLUMN IF NOT EXISTS "reason" TEXT`);
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "StockTransaction_medicineId_createdAt_idx" ON "StockTransaction"("medicineId", "createdAt")`);
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "StockTransaction_receiptId_idx" ON "StockTransaction"("receiptId")`);
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "StockTransaction_transactionType_createdAt_idx" ON "StockTransaction"("transactionType", "createdAt")`);
+
+			await prisma.$executeRawUnsafe(`
+				CREATE TABLE IF NOT EXISTS "StockBatch" (
+					"id" TEXT NOT NULL,
+					"medicineId" TEXT NOT NULL,
+					"batchNumber" TEXT,
+					"expiryDate" TIMESTAMP(3),
+					"quantity" INTEGER NOT NULL DEFAULT 0,
+					"createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+					"updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+					CONSTRAINT "StockBatch_pkey" PRIMARY KEY ("id")
+				)
+			`);
+			await prisma.$executeRawUnsafe(`CREATE UNIQUE INDEX IF NOT EXISTS "StockBatch_medicineId_batchNumber_key" ON "StockBatch"("medicineId", "batchNumber")`);
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "StockBatch_expiryDate_idx" ON "StockBatch"("expiryDate")`);
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "StockBatch_medicineId_expiryDate_idx" ON "StockBatch"("medicineId", "expiryDate")`);
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Medicine_availableQty_idx" ON "Medicine"("availableQty")`);
+
+			await prisma.$executeRawUnsafe(`
+				CREATE TABLE IF NOT EXISTS "PushSubscription" (
+					"id" TEXT NOT NULL,
+					"endpoint" TEXT NOT NULL,
+					"p256dh" TEXT NOT NULL,
+					"auth" TEXT NOT NULL,
+					"userAgent" TEXT,
+					"createdBy" TEXT,
+					"createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+					"updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+					CONSTRAINT "PushSubscription_pkey" PRIMARY KEY ("id")
+				)
+			`);
+			await prisma.$executeRawUnsafe(`CREATE UNIQUE INDEX IF NOT EXISTS "PushSubscription_endpoint_key" ON "PushSubscription"("endpoint")`);
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "PushSubscription_createdAt_idx" ON "PushSubscription"("createdAt")`);
+
+			// Best-effort FKs (ignore if already present or data conflicts)
+			const fkStatements = [
+				`ALTER TABLE "StockReceiptItem" DROP CONSTRAINT IF EXISTS "StockReceiptItem_receiptId_fkey"`,
+				`ALTER TABLE "StockReceiptItem" ADD CONSTRAINT "StockReceiptItem_receiptId_fkey" FOREIGN KEY ("receiptId") REFERENCES "StockReceipt"("id") ON DELETE CASCADE ON UPDATE CASCADE`,
+				`ALTER TABLE "StockReceiptItem" DROP CONSTRAINT IF EXISTS "StockReceiptItem_matchedMedicineId_fkey"`,
+				`ALTER TABLE "StockReceiptItem" ADD CONSTRAINT "StockReceiptItem_matchedMedicineId_fkey" FOREIGN KEY ("matchedMedicineId") REFERENCES "Medicine"("id") ON DELETE SET NULL ON UPDATE CASCADE`,
+				`ALTER TABLE "StockTransaction" DROP CONSTRAINT IF EXISTS "StockTransaction_receiptId_fkey"`,
+				`ALTER TABLE "StockTransaction" ADD CONSTRAINT "StockTransaction_receiptId_fkey" FOREIGN KEY ("receiptId") REFERENCES "StockReceipt"("id") ON DELETE RESTRICT ON UPDATE CASCADE`,
+				`ALTER TABLE "StockTransaction" DROP CONSTRAINT IF EXISTS "StockTransaction_medicineId_fkey"`,
+				`ALTER TABLE "StockTransaction" ADD CONSTRAINT "StockTransaction_medicineId_fkey" FOREIGN KEY ("medicineId") REFERENCES "Medicine"("id") ON DELETE RESTRICT ON UPDATE CASCADE`,
+				`ALTER TABLE "StockBatch" DROP CONSTRAINT IF EXISTS "StockBatch_medicineId_fkey"`,
+				`ALTER TABLE "StockBatch" ADD CONSTRAINT "StockBatch_medicineId_fkey" FOREIGN KEY ("medicineId") REFERENCES "Medicine"("id") ON DELETE CASCADE ON UPDATE CASCADE`,
+			];
+			for (const statement of fkStatements) {
+				await prisma.$executeRawUnsafe(statement).catch(() => {});
+			}
+		})().catch((error) => {
+			stockSchemaPromise = null;
+			throw error;
+		});
+	}
+	return stockSchemaPromise;
+};
+
+const requireStockSchema = async (_req, _res, next) => {
+	try {
+		await ensureStockSchema();
+		next();
+	} catch (error) {
+		next(error);
+	}
+};
 
 const allowedOrigins = process.env.FRONTEND_URL
 	? process.env.FRONTEND_URL.split(',').map((origin) => origin.trim())
@@ -122,23 +261,6 @@ const mailTransport = process.env.SMTP_HOST && mailFrom
 		auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined,
 	})
 	: null;
-
-const sendAppointmentStatusEmail = async (appointment) => {
-	if (!mailTransport) return false;
-	await mailTransport.sendMail({
-		from: mailFrom,
-		to: appointment.email,
-		subject: `Apollo Pharmacy appointment ${appointment.status.toLowerCase()}`,
-		text: [
-			`Hello ${appointment.patientName},`,
-			'',
-			`Your Apollo Pharmacy consultation request with ${appointment.doctorName} for ${appointment.timeSlot} has been ${appointment.status.toLowerCase()}.`,
-			'',
-			'Please contact the pharmacy if you need to make a change.',
-		].join('\n'),
-	});
-	return true;
-};
 
 const sendAdminAlertEmail = async (subject, text) => {
 	if (!mailTransport) return { sent: false, reason: 'smtp-not-configured' };
@@ -428,36 +550,6 @@ const parseCsvLine = (line) => {
 	return values;
 };
 
-const receiptJsonSchema = {
-	type: 'object',
-	additionalProperties: false,
-	properties: {
-		items: {
-			type: 'array',
-			items: {
-				type: 'object',
-				additionalProperties: false,
-				properties: {
-					medicine_name: { type: 'string' },
-					brand_name: { type: ['string', 'null'] },
-					generic_name: { type: ['string', 'null'] },
-					strength: { type: ['string', 'null'] },
-					dosage_form: { type: ['string', 'null'] },
-					pack_size: { type: ['string', 'null'] },
-					quantity: { type: ['integer', 'null'] },
-					unit_price: { type: ['number', 'null'] },
-					total_price: { type: ['number', 'null'] },
-					batch_number: { type: ['string', 'null'] },
-					expiry_date: { type: ['string', 'null'] },
-					confidence: { type: 'number' },
-				},
-				required: ['medicine_name', 'brand_name', 'generic_name', 'strength', 'dosage_form', 'pack_size', 'quantity', 'unit_price', 'total_price', 'batch_number', 'expiry_date', 'confidence'],
-			},
-		},
-	},
-	required: ['items'],
-};
-
 const normalizeMedicineText = (value) => String(value || '').toLowerCase()
 	.replace(/milligrams?/g, 'mg')
 	.replace(/tablets?/g, 'tablet')
@@ -507,124 +599,7 @@ const matchReceiptMedicine = (item, medicines) => {
 	return { matchStatus: 'MATCHED', matchedMedicineId: best.medicine.id, matchScore: best.score };
 };
 
-const describeOpenAiFailure = (payload, status) => {
-	const providerMessage = payload?.error?.message || payload?.message;
-	const providerCode = payload?.error?.code || payload?.error?.type;
-	if (status === 401 || status === 403) {
-		return 'Receipt AI processing failed: OpenAI API key is missing or invalid. Check OPENAI_API_KEY.';
-	}
-	if (status === 429 || providerCode === 'insufficient_quota' || providerCode === 'credit_balance_exhausted') {
-		return providerMessage
-			? `Receipt AI processing failed: ${providerMessage}`
-			: 'Receipt AI processing failed: OpenAI quota or rate limit exceeded. Add billing credits or retry later.';
-	}
-	if (typeof providerMessage === 'string' && providerMessage.trim()) {
-		return `Receipt AI processing failed: ${providerMessage.trim()}`;
-	}
-	return `Receipt AI processing failed (HTTP ${status}).`;
-};
-
-const extractOpenAiTextContent = (payload, isPdf) => {
-	if (isPdf) {
-		if (typeof payload?.output_text === 'string' && payload.output_text.trim()) {
-			return payload.output_text;
-		}
-		const outputItems = Array.isArray(payload?.output) ? payload.output : [];
-		const textParts = [];
-		for (const item of outputItems) {
-			const contents = Array.isArray(item?.content) ? item.content : [];
-			for (const part of contents) {
-				if (typeof part?.text === 'string' && part.text.trim()) textParts.push(part.text);
-			}
-		}
-		if (textParts.length > 0) return textParts.join('\n');
-	}
-	const chatContent = payload?.choices?.[0]?.message?.content;
-	if (typeof chatContent === 'string') return chatContent;
-	if (Array.isArray(chatContent)) {
-		return chatContent.map((part) => (typeof part?.text === 'string' ? part.text : '')).filter(Boolean).join('\n');
-	}
-	return null;
-};
-
-const parseReceiptAiJson = (content) => {
-	if (typeof content !== 'string' || !content.trim()) {
-		throw new Error('Receipt AI returned empty extraction data');
-	}
-	const trimmed = content.trim();
-	const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-	const candidate = fenced ? fenced[1].trim() : trimmed;
-	try {
-		return JSON.parse(candidate);
-	} catch {
-		const objectStart = candidate.indexOf('{');
-		const objectEnd = candidate.lastIndexOf('}');
-		if (objectStart >= 0 && objectEnd > objectStart) {
-			try {
-				return JSON.parse(candidate.slice(objectStart, objectEnd + 1));
-			} catch {
-				throw new Error('Receipt AI returned data that could not be parsed as JSON');
-			}
-		}
-		throw new Error('Receipt AI returned data that could not be parsed as JSON');
-	}
-};
-
-const extractReceiptItems = async (file) => {
-	if (!process.env.OPENAI_API_KEY) {
-		const error = new Error('Receipt AI processing is not configured. Set OPENAI_API_KEY on the server.');
-		error.statusCode = 503;
-		throw error;
-	}
-	const fileBuffer = Buffer.isBuffer(file.buffer) ? file.buffer : Buffer.from(file.buffer);
-	if (!fileBuffer.length) {
-		const error = new Error('Uploaded receipt file data is empty');
-		error.statusCode = 400;
-		throw error;
-	}
-	const encodedFile = fileBuffer.toString('base64');
-	const instruction = 'Read this pharmacy purchase receipt. Return only JSON matching the requested schema. Extract every medicine line, ignore non-medicine products, never guess unreadable quantities, use null for missing values, and set confidence from 0 to 1 based on legibility. Quantity means the number of packs or units purchased as printed.';
-	const isPdf = file.mimetype === 'application/pdf';
-	const configuredUrl = process.env.OPENAI_API_URL || 'https://api.openai.com/v1/chat/completions';
-	const url = isPdf && configuredUrl.endsWith('/chat/completions') ? configuredUrl.replace('/chat/completions', '/responses') : configuredUrl;
-	const body = isPdf
-		? {
-			model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-			input: [{ role: 'user', content: [{ type: 'input_text', text: instruction }, { type: 'input_file', filename: file.originalname, file_data: `data:${file.mimetype};base64,${encodedFile}` }] }],
-			text: { format: { type: 'json_schema', name: 'receipt_extraction', strict: true, schema: receiptJsonSchema } },
-		}
-		: {
-			model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-			messages: [{ role: 'user', content: [{ type: 'text', text: instruction }, { type: 'image_url', image_url: { url: `data:${file.mimetype};base64,${encodedFile}`, detail: 'high' } }] }],
-			response_format: { type: 'json_schema', json_schema: { name: 'receipt_extraction', strict: true, schema: receiptJsonSchema } },
-		};
-	let response;
-	try {
-		response = await fetch(url, {
-			method: 'POST',
-			headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-			body: JSON.stringify(body),
-		});
-	} catch (networkError) {
-		const error = new Error(`Receipt AI processing failed: could not reach OpenAI (${networkError.message})`);
-		error.statusCode = 502;
-		throw error;
-	}
-	const payload = await response.json().catch(() => ({}));
-	if (!response.ok) {
-		const error = new Error(describeOpenAiFailure(payload, response.status));
-		error.statusCode = response.status === 429 ? 429 : 502;
-		throw error;
-	}
-	const content = extractOpenAiTextContent(payload, isPdf);
-	const parsed = parseReceiptAiJson(content);
-	if (!parsed || !Array.isArray(parsed.items)) {
-		const error = new Error('Receipt AI returned invalid data (missing items array)');
-		error.statusCode = 502;
-		throw error;
-	}
-	return parsed.items;
-};
+const extractReceiptItems = async (file) => extractReceiptItemsWithTesseract(file);
 
 const getReceiptDetails = async (receiptId) => {
 	const receipts = await prisma.$queryRaw(Prisma.sql`SELECT "id", "fileName", "mimeType", "status", "uploadedBy", "uploadedAt", "processedAt", "confirmedBy", "confirmedAt", "errorMessage" FROM "StockReceipt" WHERE "id" = ${receiptId}`);
@@ -690,7 +665,7 @@ app.get('/api/medicines', async (req, res, next) => {
 	}
 });
 
-app.post('/api/stock/receipt/upload', requireAdmin, receiveReceipt, async (req, res, next) => {
+app.post('/api/stock/receipt/upload', requireAdmin, requireStockSchema, receiveReceipt, async (req, res, next) => {
 	if (!req.file) return res.status(400).json({ error: 'A JPG, PNG, or PDF receipt is required' });
 	const fileHash = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
 	try {
@@ -707,7 +682,7 @@ app.post('/api/stock/receipt/upload', requireAdmin, receiveReceipt, async (req, 
 	}
 });
 
-app.post('/api/stock/receipt/process', requireAdmin, rateLimit('receipt-process', 5, 60_000), async (req, res) => {
+app.post('/api/stock/receipt/process', requireAdmin, requireStockSchema, rateLimit('receipt-process', 5, 60_000), async (req, res) => {
 	const receiptId = typeof req.body?.receiptId === 'string' ? req.body.receiptId : '';
 	if (!receiptId) return res.status(400).json({ error: 'receiptId is required' });
 	try {
@@ -749,7 +724,7 @@ app.post('/api/stock/receipt/process', requireAdmin, rateLimit('receipt-process'
 	}
 });
 
-app.get('/api/stock/receipt/:id', requireAdmin, async (req, res, next) => {
+app.get('/api/stock/receipt/:id', requireAdmin, requireStockSchema, async (req, res, next) => {
 	try {
 		const receipt = await getReceiptDetails(req.params.id);
 		if (!receipt) return res.status(404).json({ error: 'Receipt not found' });
@@ -759,7 +734,7 @@ app.get('/api/stock/receipt/:id', requireAdmin, async (req, res, next) => {
 	}
 });
 
-app.post('/api/stock/receipt/confirm', requireAdmin, async (req, res, next) => {
+app.post('/api/stock/receipt/confirm', requireAdmin, requireStockSchema, async (req, res, next) => {
 	const receiptId = typeof req.body?.receiptId === 'string' ? req.body.receiptId : '';
 	const reviewItems = Array.isArray(req.body?.items) ? req.body.items : null;
 	if (!receiptId || !reviewItems) return res.status(400).json({ error: 'receiptId and review items are required' });
@@ -895,7 +870,7 @@ app.post('/api/stock/receipt/confirm', requireAdmin, async (req, res, next) => {
 	}
 });
 
-app.patch('/api/admin/update-stock', requireAdmin, async (req, res, next) => {
+app.patch('/api/admin/update-stock', requireAdmin, requireStockSchema, async (req, res, next) => {
 	const { medicineId, availableQty, singlePiecePrice, fullBoxPrice, expiryDate, batchNumber, reason } = req.body || {};
 	const parsedQty = Number(availableQty);
 	const parsedPiecePrice = Number(singlePiecePrice);
@@ -995,7 +970,7 @@ app.patch('/api/admin/update-stock', requireAdmin, async (req, res, next) => {
 	}
 });
 
-app.post('/api/admin/stock/adjust', requireAdmin, async (req, res, next) => {
+app.post('/api/admin/stock/adjust', requireAdmin, requireStockSchema, async (req, res, next) => {
 	const medicineId = typeof req.body?.medicineId === 'string' ? req.body.medicineId : '';
 	const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
 	const hasAbsolute = req.body?.absoluteQty !== undefined && req.body?.absoluteQty !== null && req.body?.absoluteQty !== '';
@@ -1097,7 +1072,7 @@ app.post('/api/admin/stock/adjust', requireAdmin, async (req, res, next) => {
 	}
 });
 
-app.get('/api/admin/dashboard', requireAdmin, async (_req, res, next) => {
+app.get('/api/admin/dashboard', requireAdmin, requireStockSchema, async (_req, res, next) => {
 	try {
 		const today = new Date();
 		const warningDate = new Date(today);
@@ -1116,9 +1091,6 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res, next) => {
 			SELECT COUNT(*)::int AS "count" FROM "StockBatch"
 			WHERE "quantity" > 0 AND "expiryDate" IS NOT NULL AND "expiryDate" < ${today}
 		`);
-		const [pendingAppointments] = await prisma.$queryRaw(Prisma.sql`
-			SELECT COUNT(*)::int AS "count" FROM "Appointment" WHERE "status" = 'PENDING'
-		`);
 		const [pendingReceipts] = await prisma.$queryRaw(Prisma.sql`
 			SELECT COUNT(*)::int AS "count" FROM "StockReceipt"
 			WHERE "status" IN ('PROCESSING', 'READY_FOR_REVIEW', 'FAILED')
@@ -1136,7 +1108,6 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res, next) => {
 			lowStockCount: Number(lowStock.count || 0),
 			expiringSoonCount: Number(expiringSoon.count || 0),
 			expiredCount: Number(expired.count || 0),
-			pendingAppointments: Number(pendingAppointments.count || 0),
 			pendingReceipts: Number(pendingReceipts.count || 0),
 			lowStockThreshold: resolvedLowStockThreshold,
 			expiryWarningDays: resolvedExpiryWarningDays,
@@ -1147,7 +1118,7 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res, next) => {
 	}
 });
 
-app.get('/api/admin/stock/low', requireAdmin, async (req, res, next) => {
+app.get('/api/admin/stock/low', requireAdmin, requireStockSchema, async (req, res, next) => {
 	try {
 		const thresholdRaw = Number.parseInt(req.query.threshold, 10);
 		const threshold = Number.isInteger(thresholdRaw) && thresholdRaw >= 0 ? thresholdRaw : resolvedLowStockThreshold;
@@ -1168,7 +1139,7 @@ app.get('/api/admin/stock/low', requireAdmin, async (req, res, next) => {
 	}
 });
 
-app.get('/api/admin/stock/expiring', requireAdmin, async (req, res, next) => {
+app.get('/api/admin/stock/expiring', requireAdmin, requireStockSchema, async (req, res, next) => {
 	try {
 		const daysRaw = Number.parseInt(req.query.days, 10);
 		const days = Number.isInteger(daysRaw) && daysRaw > 0 ? daysRaw : resolvedExpiryWarningDays;
@@ -1202,7 +1173,7 @@ app.get('/api/admin/stock/expiring', requireAdmin, async (req, res, next) => {
 	}
 });
 
-app.get('/api/admin/batches', requireAdmin, async (req, res, next) => {
+app.get('/api/admin/batches', requireAdmin, requireStockSchema, async (req, res, next) => {
 	try {
 		const medicineId = typeof req.query.medicineId === 'string' ? req.query.medicineId : '';
 		if (!medicineId) return res.status(400).json({ error: 'medicineId is required' });
@@ -1219,7 +1190,7 @@ app.get('/api/admin/batches', requireAdmin, async (req, res, next) => {
 	}
 });
 
-app.patch('/api/admin/batches/:id', requireAdmin, async (req, res, next) => {
+app.patch('/api/admin/batches/:id', requireAdmin, requireStockSchema, async (req, res, next) => {
 	const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
 	if (!reason || reason.length > 200) return res.status(400).json({ error: 'reason is required (max 200 characters)' });
 	const hasQuantity = req.body?.quantity !== undefined && req.body?.quantity !== null && req.body?.quantity !== '';
@@ -1280,7 +1251,7 @@ app.patch('/api/admin/batches/:id', requireAdmin, async (req, res, next) => {
 	}
 });
 
-app.get('/api/admin/stock/transactions', requireAdmin, async (req, res, next) => {
+app.get('/api/admin/stock/transactions', requireAdmin, requireStockSchema, async (req, res, next) => {
 	try {
 		const { limit, offset } = parseLimitOffset(req.query, 50, 200);
 		const medicineId = typeof req.query.medicineId === 'string' && req.query.medicineId ? req.query.medicineId : null;
@@ -1317,7 +1288,7 @@ app.get('/api/admin/stock/transactions', requireAdmin, async (req, res, next) =>
 	}
 });
 
-app.get('/api/admin/receipts', requireAdmin, async (req, res, next) => {
+app.get('/api/admin/receipts', requireAdmin, requireStockSchema, async (req, res, next) => {
 	try {
 		const { limit, offset } = parseLimitOffset(req.query, 50, 200);
 		const status = typeof req.query.status === 'string' && req.query.status.trim() ? req.query.status.trim().toUpperCase() : null;
@@ -1338,13 +1309,20 @@ app.get('/api/admin/receipts', requireAdmin, async (req, res, next) => {
 	}
 });
 
-app.post('/api/admin/medicines', requireAdmin, async (req, res, next) => {
+app.post('/api/admin/medicines', requireAdmin, requireStockSchema, async (req, res, next) => {
 	const brandName = typeof req.body?.brandName === 'string' ? req.body.brandName.trim() : '';
 	const genericName = typeof req.body?.genericName === 'string' ? req.body.genericName.trim() : '';
 	const manufacturer = typeof req.body?.manufacturer === 'string' ? req.body.manufacturer.trim() : '';
 	const strength = typeof req.body?.strength === 'string' ? req.body.strength.trim() : '';
 	const singlePiecePrice = req.body?.singlePiecePrice === undefined ? 0 : Number(req.body.singlePiecePrice);
 	const fullBoxPrice = req.body?.fullBoxPrice === undefined ? 0 : Number(req.body.fullBoxPrice);
+	const hasInitialQty = req.body?.availableQty !== undefined && req.body?.availableQty !== null && req.body?.availableQty !== '';
+	const availableQty = hasInitialQty ? Number(req.body.availableQty) : 0;
+	const batchNumber = normalizeBatchNumber(req.body?.batchNumber);
+	const parsedExpiry = parseExpiryDate(req.body?.expiryDate);
+	const reason = typeof req.body?.reason === 'string' && req.body.reason.trim()
+		? req.body.reason.trim().slice(0, 200)
+		: 'Initial stock on create';
 
 	if (!brandName || !genericName || !manufacturer || !strength) {
 		return res.status(400).json({ error: 'brandName, genericName, manufacturer, and strength are required' });
@@ -1352,30 +1330,63 @@ app.post('/api/admin/medicines', requireAdmin, async (req, res, next) => {
 	if (!Number.isFinite(singlePiecePrice) || singlePiecePrice < 0 || !Number.isFinite(fullBoxPrice) || fullBoxPrice < 0) {
 		return res.status(400).json({ error: 'Prices must be non-negative numbers' });
 	}
+	if (!Number.isInteger(availableQty) || availableQty < 0) {
+		return res.status(400).json({ error: 'availableQty must be a non-negative integer' });
+	}
+	if (availableQty > 0 && !parsedExpiry) {
+		return res.status(400).json({ error: 'expiryDate is required when adding initial stock' });
+	}
 
 	try {
-		// Sync uniqueness is brandName-only; also reject exact brandName+strength duplicates.
 		const existing = await prisma.$queryRaw(Prisma.sql`
 			SELECT "id", "brandName", "strength" FROM "Medicine"
-			WHERE "brandName" = ${brandName}
-			LIMIT 5
+			WHERE "brandName" = ${brandName} AND "strength" = ${strength}
+			LIMIT 1
 		`);
-		if (existing.some((row) => row.strength === strength) || existing.length > 0) {
-			return res.status(409).json({ error: 'A medicine with this brandName already exists (sync uniqueness is brandName)' });
+		if (existing.length > 0) {
+			return res.status(409).json({ error: 'A medicine with this brandName and strength already exists' });
 		}
-		const id = crypto.randomUUID();
-		const rows = await prisma.$queryRaw(Prisma.sql`
-			INSERT INTO "Medicine" ("id", "brandName", "genericName", "manufacturer", "strength", "availableQty", "piece_price", "box_price", "createdAt", "updatedAt")
-			VALUES (${id}, ${brandName}, ${genericName}, ${manufacturer}, ${strength}, 0, ${singlePiecePrice}, ${fullBoxPrice}, NOW(), NOW())
-			RETURNING *
-		`);
-		const medicine = rows[0];
+
+		const medicine = await prisma.$transaction(async (tx) => {
+			const id = crypto.randomUUID();
+			const rows = await tx.$queryRaw(Prisma.sql`
+				INSERT INTO "Medicine" ("id", "brandName", "genericName", "manufacturer", "strength", "availableQty", "piece_price", "box_price", "createdAt", "updatedAt")
+				VALUES (${id}, ${brandName}, ${genericName}, ${manufacturer}, ${strength}, 0, ${singlePiecePrice}, ${fullBoxPrice}, NOW(), NOW())
+				RETURNING *
+			`);
+			let created = rows[0];
+			if (availableQty > 0) {
+				await addToStockBatch(tx, {
+					medicineId: id,
+					batchNumber,
+					expiryDate: parsedExpiry,
+					quantityDelta: availableQty,
+				});
+				const newStock = await recomputeMedicineQty(tx, id);
+				await writeStockTransaction(tx, {
+					medicineId: id,
+					transactionType: 'MANUAL_ADJUSTMENT',
+					quantity: availableQty,
+					previousStock: 0,
+					newStock,
+					batchNumber,
+					expiryDate: parsedExpiry,
+					reason,
+					createdBy: req.adminId || 'admin',
+				});
+				const refreshed = await tx.$queryRaw(Prisma.sql`SELECT * FROM "Medicine" WHERE "id" = ${id}`);
+				created = refreshed[0];
+			}
+			return created;
+		});
+
 		res.status(201).json(serializeDatabaseValue({
 			...medicine,
 			singlePiecePrice: Number(medicine.piece_price ?? 0),
 			fullBoxPrice: Number(medicine.box_price ?? 0),
 		}));
 	} catch (error) {
+		if (error.statusCode === 400) return res.status(400).json({ error: error.message });
 		next(error);
 	}
 });
@@ -1414,7 +1425,7 @@ app.patch('/api/admin/medicines/:id', requireAdmin, async (req, res, next) => {
 	}
 });
 
-app.post('/api/admin/alerts/expiry/send', requireAdmin, async (req, res, next) => {
+app.post('/api/admin/alerts/expiry/send', requireAdmin, requireStockSchema, async (req, res, next) => {
 	try {
 		const daysRaw = Number.parseInt(req.body?.days, 10);
 		const days = Number.isInteger(daysRaw) && daysRaw > 0 ? daysRaw : resolvedExpiryWarningDays;
@@ -1439,13 +1450,13 @@ app.post('/api/admin/alerts/expiry/send', requireAdmin, async (req, res, next) =
 	}
 });
 
-app.get('/api/admin/push/status', requireAdmin, async (_req, res) => {
+app.get('/api/admin/push/status', requireAdmin, requireStockSchema, async (_req, res) => {
 	const vapid = getVapidConfig();
 	if (!vapid) return res.json({ enabled: false, reason: 'vapid-not-configured' });
 	res.json({ enabled: true, publicKey: vapid.publicKey });
 });
 
-app.post('/api/admin/push/subscribe', requireAdmin, async (req, res, next) => {
+app.post('/api/admin/push/subscribe', requireAdmin, requireStockSchema, async (req, res, next) => {
 	try {
 		if (!getVapidConfig()) return res.status(503).json({ error: 'Push notifications are not configured (missing VAPID keys)', reason: 'vapid-not-configured' });
 		const endpoint = typeof req.body?.endpoint === 'string' ? req.body.endpoint.trim() : '';
@@ -1472,7 +1483,7 @@ app.post('/api/admin/push/subscribe', requireAdmin, async (req, res, next) => {
 	}
 });
 
-app.delete('/api/admin/push/subscribe', requireAdmin, async (req, res, next) => {
+app.delete('/api/admin/push/subscribe', requireAdmin, requireStockSchema, async (req, res, next) => {
 	try {
 		const endpoint = typeof req.body?.endpoint === 'string' ? req.body.endpoint.trim() : '';
 		if (!endpoint) return res.status(400).json({ error: 'endpoint is required' });
@@ -1483,7 +1494,7 @@ app.delete('/api/admin/push/subscribe', requireAdmin, async (req, res, next) => 
 	}
 });
 
-app.post('/api/admin/push/cron/expiry', requireCronOrAdmin, async (req, res, next) => {
+app.post('/api/admin/push/cron/expiry', requireCronOrAdmin, requireStockSchema, async (req, res, next) => {
 	try {
 		if (!getVapidConfig()) {
 			return res.json({ sent: false, reason: 'vapid-not-configured', count: 0 });
@@ -1505,87 +1516,26 @@ app.post('/api/admin/push/cron/expiry', requireCronOrAdmin, async (req, res, nex
 	}
 });
 
-app.get('/api/admin/appointments', requireAdmin, async (req, res, next) => {
-	try {
-		const { limit, offset } = parseLimitOffset(req.query, 50, 200);
-		const status = typeof req.query.status === 'string' ? req.query.status.trim().toUpperCase() : '';
-		const validStatus = ['PENDING', 'ACCEPTED', 'REJECTED'].includes(status) ? status : null;
-		const appointmentColumns = await prisma.$queryRaw(Prisma.sql`
-			SELECT "column_name" FROM information_schema.columns
-			WHERE "table_schema" = 'public' AND "table_name" = 'Appointment'
-			AND "column_name" = 'email'
-		`);
-		const hasEmail = appointmentColumns.length > 0;
-		let appointments;
-		if (hasEmail && validStatus) {
-			appointments = await prisma.$queryRaw(Prisma.sql`
-				SELECT "id", "patientName", "email", "phoneNumber", "doctorName", "timeSlot", "status", "createdAt", "updatedAt"
-				FROM "Appointment" WHERE "status" = ${validStatus}
-				ORDER BY "createdAt" DESC LIMIT ${limit} OFFSET ${offset}
-			`);
-		} else if (hasEmail) {
-			appointments = await prisma.$queryRaw(Prisma.sql`
-				SELECT "id", "patientName", "email", "phoneNumber", "doctorName", "timeSlot", "status", "createdAt", "updatedAt"
-				FROM "Appointment" ORDER BY "createdAt" DESC LIMIT ${limit} OFFSET ${offset}
-			`);
-		} else if (validStatus) {
-			appointments = await prisma.$queryRaw(Prisma.sql`
-				SELECT "id", "patientName", "phoneNumber", "doctorName", "timeSlot", "status", "createdAt", "updatedAt"
-				FROM "Appointment" WHERE "status" = ${validStatus}
-				ORDER BY "createdAt" DESC LIMIT ${limit} OFFSET ${offset}
-			`);
-		} else {
-			appointments = await prisma.$queryRaw(Prisma.sql`
-				SELECT "id", "patientName", "phoneNumber", "doctorName", "timeSlot", "status", "createdAt", "updatedAt"
-				FROM "Appointment" ORDER BY "createdAt" DESC LIMIT ${limit} OFFSET ${offset}
-			`);
-		}
-		res.json(serializeDatabaseValue(appointments));
-	} catch (error) {
-		next(error);
-	}
+app.post('/api/appointments', (_req, res) => {
+	res.status(410).json({ error: 'Appointments have been removed from this pharmacy.' });
 });
 
-app.patch('/api/admin/appointments/:id', requireAdmin, async (req, res, next) => {
-	const status = typeof req.body?.status === 'string' ? req.body.status.toUpperCase() : '';
-	if (!['ACCEPTED', 'REJECTED', 'PENDING'].includes(status)) {
-		return res.status(400).json({ error: 'status must be ACCEPTED, REJECTED, or PENDING' });
-	}
+app.get('/api/admin/appointments', requireAdmin, (_req, res) => {
+	res.status(410).json({ error: 'Appointments have been removed from this pharmacy.' });
+});
 
-	try {
-		const appointments = await prisma.$queryRaw(Prisma.sql`
-			UPDATE "Appointment" SET "status" = ${status}, "updatedAt" = NOW()
-			WHERE "id" = ${String(req.params.id)} RETURNING *
-		`);
-		if (appointments.length === 0) return res.status(404).json({ error: 'Appointment not found' });
-		const appointment = appointments[0];
-		let notificationSent = false;
-		let notificationReason = 'missing-email';
-		try {
-			if (typeof appointment.email === 'string' && appointment.email.length > 0) {
-				notificationSent = await sendAppointmentStatusEmail(appointment);
-				notificationReason = notificationSent ? 'sent' : 'smtp-not-configured';
-			} else if (!mailTransport || !process.env.MAIL_FROM) {
-				notificationReason = 'smtp-not-configured';
-			}
-		} catch (emailError) {
-			console.error('Appointment email failed:', emailError);
-			notificationReason = 'delivery-failed';
-		}
-		res.json(serializeDatabaseValue({ ...appointment, notificationSent, notificationReason }));
-	} catch (error) {
-		if (error.code === 'P2025') {
-			return res.status(404).json({ error: 'Appointment not found' });
-		}
-		next(error);
-	}
+app.patch('/api/admin/appointments/:id', requireAdmin, (_req, res) => {
+	res.status(410).json({ error: 'Appointments have been removed from this pharmacy.' });
 });
 
 app.post('/api/admin/medicines/sync', requireAdmin, async (_req, res, next) => {
 	const apiUrl = process.env.MEDICINE_API_URL || DEFAULT_MEDICINE_API_URL;
 
 	try {
-		const response = await fetch(apiUrl, { headers: { Accept: 'application/json' } });
+		const response = await fetch(apiUrl, {
+			headers: { Accept: 'text/csv, application/json;q=0.9, */*;q=0.8' },
+			signal: AbortSignal.timeout(25_000),
+		});
 		if (!response.ok) return res.status(502).json({ error: 'Medicine API request failed' });
 		const contentType = response.headers.get('content-type') || '';
 		const payload = contentType.includes('json') ? await response.json() : await response.text();
@@ -1617,13 +1567,16 @@ app.post('/api/admin/medicines/sync', requireAdmin, async (_req, res, next) => {
 			const batch = records.slice(index, index + 25);
 			const results = await Promise.all(batch.map(async (item) => {
 				const brandName = String(item.brandName || item.brand || item.name || '').trim();
+				const strength = String(item.strength || item.dosage || 'Standard').trim();
 				if (!brandName) return 'skipped';
 				try {
-					const existing = await prisma.$queryRaw(Prisma.sql`SELECT "id" FROM "Medicine" WHERE "brandName" = ${brandName} LIMIT 1`);
+					const existing = await prisma.$queryRaw(Prisma.sql`
+						SELECT "id" FROM "Medicine" WHERE "brandName" = ${brandName} AND "strength" = ${strength} LIMIT 1
+					`);
 					if (existing.length > 0) return 'skipped';
 					await prisma.$executeRaw(Prisma.sql`
 						INSERT INTO "Medicine" ("id", "brandName", "genericName", "manufacturer", "strength", "availableQty", "createdAt", "updatedAt")
-						VALUES (${crypto.randomUUID()}, ${brandName}, ${String(item.genericName || item.generic || 'Generic Formula').trim()}, ${String(item.manufacturer || item.company || 'Bangladeshi Pharma').trim()}, ${String(item.strength || item.dosage || 'Standard').trim()}, 0, NOW(), NOW())
+						VALUES (${crypto.randomUUID()}, ${brandName}, ${String(item.genericName || item.generic || 'Generic Formula').trim()}, ${String(item.manufacturer || item.company || 'Bangladeshi Pharma').trim()}, ${strength}, 0, NOW(), NOW())
 					`);
 					return 'imported';
 				} catch (rowError) {
@@ -1636,58 +1589,9 @@ app.post('/api/admin/medicines/sync', requireAdmin, async (_req, res, next) => {
 		}
 		res.json({ imported, skipped, total: records.length });
 	} catch (error) {
-		next(error);
-	}
-});
-
-app.post('/api/appointments', async (req, res, next) => {
-	const { patientName, email, phoneNumber, doctorName, timeSlot, note } = req.body || {};
-
-	if (![patientName, email, phoneNumber, doctorName, timeSlot].every(
-		(value) => typeof value === 'string' && value.trim().length > 0,
-	)) {
-		return res.status(400).json({
-			error: 'patientName, email, phoneNumber, doctorName, and timeSlot are required',
-		});
-	}
-	if (!/^\S+@\S+\.\S+$/.test(email.trim())) {
-		return res.status(400).json({ error: 'A valid email address is required' });
-	}
-
-	try {
-		const columns = await prisma.$queryRaw(Prisma.sql`
-			SELECT "column_name" FROM information_schema.columns
-			WHERE "table_schema" = 'public' AND "table_name" = 'Appointment'
-			AND "column_name" IN ('email', 'note')
-		`);
-		const hasEmail = columns.some((column) => column.column_name === 'email');
-		const hasNote = columns.some((column) => column.column_name === 'note');
-		const appointmentId = crypto.randomUUID();
-		let appointment;
-		if (hasEmail && hasNote) {
-			appointment = (await prisma.$queryRaw(Prisma.sql`
-				INSERT INTO "Appointment" ("id", "patientName", "email", "phoneNumber", "doctorName", "timeSlot", "note", "status", "createdAt", "updatedAt")
-				VALUES (${appointmentId}, ${patientName.trim()}, ${email.trim().toLowerCase()}, ${phoneNumber.trim()}, ${doctorName.trim()}, ${timeSlot.trim()}, ${typeof note === 'string' && note.trim() ? note.trim() : null}, 'PENDING', NOW(), NOW()) RETURNING *
-			`))[0];
-		} else if (hasEmail) {
-			appointment = (await prisma.$queryRaw(Prisma.sql`
-				INSERT INTO "Appointment" ("id", "patientName", "email", "phoneNumber", "doctorName", "timeSlot", "status", "createdAt", "updatedAt")
-				VALUES (${appointmentId}, ${patientName.trim()}, ${email.trim().toLowerCase()}, ${phoneNumber.trim()}, ${doctorName.trim()}, ${timeSlot.trim()}, 'PENDING', NOW(), NOW()) RETURNING *
-			`))[0];
-		} else if (hasNote) {
-			appointment = (await prisma.$queryRaw(Prisma.sql`
-				INSERT INTO "Appointment" ("id", "patientName", "phoneNumber", "doctorName", "timeSlot", "note", "status", "createdAt", "updatedAt")
-				VALUES (${appointmentId}, ${patientName.trim()}, ${phoneNumber.trim()}, ${doctorName.trim()}, ${timeSlot.trim()}, ${typeof note === 'string' && note.trim() ? note.trim() : null}, 'PENDING', NOW(), NOW()) RETURNING *
-			`))[0];
-		} else {
-			appointment = (await prisma.$queryRaw(Prisma.sql`
-				INSERT INTO "Appointment" ("id", "patientName", "phoneNumber", "doctorName", "timeSlot", "status", "createdAt", "updatedAt")
-				VALUES (${appointmentId}, ${patientName.trim()}, ${phoneNumber.trim()}, ${doctorName.trim()}, ${timeSlot.trim()}, 'PENDING', NOW(), NOW()) RETURNING *
-			`))[0];
+		if (error.name === 'TimeoutError' || error.name === 'AbortError') {
+			return res.status(504).json({ error: 'Medicine catalog sync timed out. Try again later.' });
 		}
-
-		res.status(201).json(serializeDatabaseValue(appointment));
-	} catch (error) {
 		next(error);
 	}
 });
@@ -1706,7 +1610,7 @@ app.post('/api/chat', rateLimit('chat', 15, 60_000), async (req, res, next) => {
 
 	const systemPrompt = [
 		'You are the helpful assistant for a local pharmacy in Bangladesh.',
-		'You can help users check medicine stock and book a doctor appointment.',
+		'You can help users with medicine catalog questions, wellness tips, and pharmacy services.',
 		'You must not diagnose conditions, prescribe medicine, or recommend a dosage.',
 		'For medical emergencies, advise the user to contact local emergency services or a qualified doctor.',
 		'Keep responses clear and concise. Do not claim to have completed an action unless the application confirms it.',
@@ -1765,7 +1669,7 @@ const sendCsv = (res, filename, headers, rows) => {
 	res.send(lines.join('\n'));
 };
 
-app.get('/api/admin/export/stock.csv', requireAdmin, async (_req, res, next) => {
+app.get('/api/admin/export/stock.csv', requireAdmin, requireStockSchema, async (_req, res, next) => {
 	try {
 		const rows = await prisma.$queryRaw(Prisma.sql`
 			SELECT "brandName", "genericName", "manufacturer", "strength", "availableQty",
@@ -1785,7 +1689,7 @@ app.get('/api/admin/export/stock.csv', requireAdmin, async (_req, res, next) => 
 	}
 });
 
-app.get('/api/admin/export/transactions.csv', requireAdmin, async (req, res, next) => {
+app.get('/api/admin/export/transactions.csv', requireAdmin, requireStockSchema, async (req, res, next) => {
 	try {
 		const from = parseExpiryDate(req.query.from) || (typeof req.query.from === 'string' && req.query.from ? new Date(req.query.from) : null);
 		const to = parseExpiryDate(req.query.to) || (typeof req.query.to === 'string' && req.query.to ? new Date(req.query.to) : null);
@@ -1824,7 +1728,13 @@ app.get('/api/admin/export/transactions.csv', requireAdmin, async (req, res, nex
 
 app.use((error, _req, res, _next) => {
 	console.error(error);
-	res.status(500).json({ error: 'Internal server error' });
+	const message = typeof error?.message === 'string' && error.message.trim()
+		? error.message.trim()
+		: 'Internal server error';
+	const expose = process.env.NODE_ENV !== 'production' || Boolean(error?.expose);
+	res.status(Number.isInteger(error?.statusCode) ? error.statusCode : 500).json({
+		error: expose ? message : 'Internal server error',
+	});
 });
 
 if (require.main === module) {

@@ -8,6 +8,10 @@ const emptyForm = {
   strength: '',
   singlePiecePrice: '0',
   fullBoxPrice: '0',
+  availableQty: '0',
+  batchNumber: '',
+  expiryDate: '',
+  reason: 'Initial stock on create',
 }
 
 export default function MedicineFormModal({ token, medicine, onClose, onSaved }) {
@@ -19,6 +23,7 @@ export default function MedicineFormModal({ token, medicine, onClose, onSaved })
   useEffect(() => {
     if (medicine) {
       setForm({
+        ...emptyForm,
         brandName: medicine.brandName || '',
         genericName: medicine.genericName || '',
         manufacturer: medicine.manufacturer || '',
@@ -38,6 +43,7 @@ export default function MedicineFormModal({ token, medicine, onClose, onSaved })
     setError('')
     const singlePiecePrice = Number(form.singlePiecePrice)
     const fullBoxPrice = Number(form.fullBoxPrice)
+    const availableQty = Number.parseInt(form.availableQty, 10)
     if (!form.brandName.trim() || !form.genericName.trim() || !form.manufacturer.trim() || !form.strength.trim()) {
       setError('All medicine fields are required.')
       return
@@ -46,6 +52,15 @@ export default function MedicineFormModal({ token, medicine, onClose, onSaved })
       setError('Prices must be non-negative numbers.')
       return
     }
+    if (!isEdit && (!Number.isInteger(availableQty) || availableQty < 0)) {
+      setError('Initial stock must be a non-negative whole number.')
+      return
+    }
+    if (!isEdit && availableQty > 0 && !form.expiryDate.trim()) {
+      setError('Expiry date is required when adding initial stock.')
+      return
+    }
+
     const payload = {
       brandName: form.brandName.trim(),
       genericName: form.genericName.trim(),
@@ -54,6 +69,15 @@ export default function MedicineFormModal({ token, medicine, onClose, onSaved })
       singlePiecePrice,
       fullBoxPrice,
     }
+    if (!isEdit) {
+      payload.availableQty = availableQty
+      if (availableQty > 0) {
+        payload.batchNumber = form.batchNumber.trim() || undefined
+        payload.expiryDate = form.expiryDate.trim()
+        payload.reason = form.reason.trim() || 'Initial stock on create'
+      }
+    }
+
     try {
       setIsSaving(true)
       const saved = isEdit
@@ -74,7 +98,11 @@ export default function MedicineFormModal({ token, medicine, onClose, onSaved })
         <div className="flex items-start justify-between gap-3">
           <div>
             <h2 className="text-2xl font-extrabold">{isEdit ? 'Edit medicine' : 'Add medicine'}</h2>
-            <p className="mt-1 text-sm text-[#607487]">Metadata and prices only. Stock changes use Adjust or Receipt.</p>
+            <p className="mt-1 text-sm text-[#607487]">
+              {isEdit
+                ? 'Update metadata and prices. Use Adjust stock for quantity changes.'
+                : 'Creates the medicine in the database. Optional initial stock syncs to StockBatch.'}
+            </p>
           </div>
           <button type="button" onClick={onClose} className="rounded-lg px-2 py-1 text-sm font-bold text-[#607487]">Close</button>
         </div>
@@ -101,6 +129,49 @@ export default function MedicineFormModal({ token, medicine, onClose, onSaved })
             </label>
           ))}
         </div>
+
+        {!isEdit && (
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <label className="text-xs font-bold text-[#607487]">
+              Initial stock qty
+              <input
+                className="mt-1 w-full rounded-lg border border-[#d9e7f0] bg-[#f4f9fc] px-3 py-2 text-sm text-[#172b3d] dark:border-slate-600 dark:bg-slate-800 dark:text-white"
+                type="number"
+                min="0"
+                value={form.availableQty}
+                onChange={(event) => updateField('availableQty', event.target.value)}
+              />
+            </label>
+            <label className="text-xs font-bold text-[#607487]">
+              Batch number
+              <input
+                className="mt-1 w-full rounded-lg border border-[#d9e7f0] bg-[#f4f9fc] px-3 py-2 text-sm text-[#172b3d] dark:border-slate-600 dark:bg-slate-800 dark:text-white"
+                value={form.batchNumber}
+                onChange={(event) => updateField('batchNumber', event.target.value)}
+              />
+            </label>
+            <label className="text-xs font-bold text-[#607487]">
+              Expiry date {Number.parseInt(form.availableQty, 10) > 0 ? '(required)' : '(optional)'}
+              <input
+                className="mt-1 w-full rounded-lg border border-[#d9e7f0] bg-[#f4f9fc] px-3 py-2 text-sm text-[#172b3d] dark:border-slate-600 dark:bg-slate-800 dark:text-white"
+                type="date"
+                value={form.expiryDate}
+                onChange={(event) => updateField('expiryDate', event.target.value)}
+                required={Number.parseInt(form.availableQty, 10) > 0}
+              />
+            </label>
+            <label className="text-xs font-bold text-[#607487]">
+              Stock reason
+              <input
+                className="mt-1 w-full rounded-lg border border-[#d9e7f0] bg-[#f4f9fc] px-3 py-2 text-sm text-[#172b3d] dark:border-slate-600 dark:bg-slate-800 dark:text-white"
+                value={form.reason}
+                maxLength={200}
+                onChange={(event) => updateField('reason', event.target.value)}
+              />
+            </label>
+          </div>
+        )}
+
         {error && <p className="mt-4 rounded-xl bg-[#fff0ef] p-3 text-sm font-semibold text-[#b94f49]">{error}</p>}
         <button type="submit" disabled={isSaving} className="mt-5 w-full rounded-xl bg-[#2f80c0] px-4 py-3 font-bold text-white hover:bg-[#18527f] disabled:opacity-60">
           {isSaving ? 'Saving…' : (isEdit ? 'Save changes' : 'Create medicine')}
