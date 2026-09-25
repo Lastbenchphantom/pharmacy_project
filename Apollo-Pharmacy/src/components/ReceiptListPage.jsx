@@ -21,10 +21,14 @@ export default function ReceiptListPage() {
   }
 
   useEffect(() => {
-    if (!token) return
-    loadRows()
-      .catch((loadError) => setError(loadError.message))
-      .finally(() => setIsLoading(false))
+    if (!token) return undefined
+    let cancelled = false
+    queueMicrotask(() => {
+      loadRows()
+        .catch((loadError) => { if (!cancelled) setError(loadError.message) })
+        .finally(() => { if (!cancelled) setIsLoading(false) })
+    })
+    return () => { cancelled = true }
   }, [token])
 
   const changeStatus = async (nextStatus) => {

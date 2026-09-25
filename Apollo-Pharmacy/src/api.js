@@ -1,17 +1,42 @@
 const API_URL = (import.meta.env.VITE_API_URL || 'http://localhost:5000/api').replace(/\/$/, '')
+const REQUEST_TIMEOUT_MS = 90_000
 
 async function request(path, options = {}) {
-  const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData
-  const response = await fetch(`${API_URL}${path}`, {
-    headers: {
-      ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
-      ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}),
-      ...options.headers,
-    },
-    ...options,
-  })
-  const data = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(data.error || 'The pharmacy service is unavailable.')
+  const { token, headers: extraHeaders, signal, ...fetchOptions } = options
+  const isFormData = typeof FormData !== 'undefined' && fetchOptions.body instanceof FormData
+  const timeoutSignal = signal ?? (typeof AbortSignal !== 'undefined' && AbortSignal.timeout
+    ? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    : undefined)
+
+  let response
+  try {
+    response = await fetch(`${API_URL}${path}`, {
+      ...fetchOptions,
+      signal: timeoutSignal,
+      headers: {
+        ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...extraHeaders,
+      },
+    })
+  } catch (error) {
+    if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+      throw new Error('The pharmacy service timed out. Please try again.', { cause: error })
+    }
+    throw new Error('The pharmacy service is unavailable.', { cause: error })
+  }
+
+  const contentType = response.headers.get('content-type') || ''
+  const data = contentType.includes('application/json')
+    ? await response.json().catch(() => ({}))
+    : {}
+
+  if (!response.ok) {
+    throw new Error(data.error || 'The pharmacy service is unavailable.')
+  }
+  if (!contentType.includes('application/json')) {
+    throw new Error('The pharmacy service returned an unexpected response.')
+  }
   return data
 }
 
@@ -24,9 +49,36 @@ const withQuery = (path, params = {}) => {
   return `${path}${suffix}`
 }
 
-export const getMedicines = ({ limit, random = false, search = '', offset } = {}) => (
-  request(withQuery('/medicines', { limit, random: random ? 'true' : undefined, search, offset }))
-)
+const asArray = (data) => {
+  if (Array.isArray(data)) return data
+  if (Array.isArray(data?.items)) return data.items
+  if (Array.isArray(data?.data)) return data.data
+  return []
+}
+
+/** Paginated medicine fetch. Never requests unbounded catalogs. */
+export const fetchMedicines = async ({ limit = 25, page, offset, random = false, search = '' } = {}) => {
+  const cappedLimit = Math.min(Math.max(Number(limit) || 25, 1), 100)
+  const data = await request(withQuery('/medicines', {
+    limit: cappedLimit,
+    page,
+    offset,
+    random: random ? 'true' : undefined,
+    search: search || undefined,
+  }))
+  const items = asArray(data)
+  const pagination = data?.pagination || {
+    page: page || 1,
+    limit: cappedLimit,
+    offset: offset || 0,
+    total: items.length,
+    totalPages: 1,
+  }
+  return { items, pagination }
+}
+
+/** Convenience wrapper that returns only the medicine array (for typeaheads). */
+export const getMedicines = async (options = {}) => (await fetchMedicines(options)).items
 
 export const loginAdmin = (password) => request('/admin/login', {
   method: 'POST',
@@ -54,6 +106,9 @@ export const processStockReceipt = (token, receiptId) => request('/stock/receipt
   method: 'POST',
   token,
   body: JSON.stringify({ receiptId }),
+  signal: typeof AbortSignal !== 'undefined' && AbortSignal.timeout
+    ? AbortSignal.timeout(120_000)
+    : undefined,
 })
 
 export const getStockReceipt = (token, receiptId) => request(`/stock/receipt/${receiptId}`, { token })
@@ -66,17 +121,17 @@ export const confirmStockReceipt = (token, receiptId, items) => request('/stock/
 
 export const getDashboard = (token) => request('/admin/dashboard', { token })
 
-export const getLowStock = (token, { threshold, limit, offset } = {}) => (
-  request(withQuery('/admin/stock/low', { threshold, limit, offset }), { token })
+export const getLowStock = async (token, { threshold, limit, offset } = {}) => (
+  asArray(await request(withQuery('/admin/stock/low', { threshold, limit, offset }), { token }))
 )
 
-export const getExpiringStock = (token, { days, includeExpired = true, limit, offset } = {}) => (
-  request(withQuery('/admin/stock/expiring', {
+export const getExpiringStock = async (token, { days, includeExpired = true, limit, offset } = {}) => (
+  asArray(await request(withQuery('/admin/stock/expiring', {
     days,
     includeExpired: includeExpired ? 'true' : 'false',
     limit,
     offset,
-  }), { token })
+  }), { token }))
 )
 
 export const adjustStock = (token, payload) => request('/admin/stock/adjust', {
@@ -85,8 +140,8 @@ export const adjustStock = (token, payload) => request('/admin/stock/adjust', {
   body: JSON.stringify(payload),
 })
 
-export const getBatches = (token, medicineId) => (
-  request(withQuery('/admin/batches', { medicineId }), { token })
+export const getBatches = async (token, medicineId) => (
+  asArray(await request(withQuery('/admin/batches', { medicineId }), { token }))
 )
 
 export const updateBatch = (token, batchId, payload) => request(`/admin/batches/${batchId}`, {
@@ -95,12 +150,12 @@ export const updateBatch = (token, batchId, payload) => request(`/admin/batches/
   body: JSON.stringify(payload),
 })
 
-export const getStockTransactions = (token, { medicineId, type, from, to, limit, offset } = {}) => (
-  request(withQuery('/admin/stock/transactions', { medicineId, type, from, to, limit, offset }), { token })
+export const getStockTransactions = async (token, { medicineId, type, from, to, limit, offset } = {}) => (
+  asArray(await request(withQuery('/admin/stock/transactions', { medicineId, type, from, to, limit, offset }), { token }))
 )
 
-export const getReceipts = (token, { status, limit, offset } = {}) => (
-  request(withQuery('/admin/receipts', { status, limit, offset }), { token })
+export const getReceipts = async (token, { status, limit, offset } = {}) => (
+  asArray(await request(withQuery('/admin/receipts', { status, limit, offset }), { token }))
 )
 
 export const createMedicine = (token, payload) => request('/admin/medicines', {
@@ -127,9 +182,21 @@ export const sendChat = (prompt) => request('/chat', {
 })
 
 async function downloadCsv(path, token, fallbackName) {
-  const response = await fetch(`${API_URL}${path}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  })
+  const timeoutSignal = typeof AbortSignal !== 'undefined' && AbortSignal.timeout
+    ? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    : undefined
+  let response
+  try {
+    response = await fetch(`${API_URL}${path}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: timeoutSignal,
+    })
+  } catch (error) {
+    if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+      throw new Error('CSV export timed out.', { cause: error })
+    }
+    throw new Error('CSV export failed.', { cause: error })
+  }
   if (!response.ok) {
     const data = await response.json().catch(() => ({}))
     throw new Error(data.error || 'CSV export failed.')

@@ -17,11 +17,16 @@ export default function StockAdjustPanel({
   const [isSaving, setIsSaving] = useState(false)
 
   useEffect(() => {
-    setAbsoluteQty(String(currentQty))
-    setBatchNumber(batch?.batchNumber || '')
-    setExpiryDate(batch?.expiryDate ? String(batch.expiryDate).slice(0, 10) : '')
-    setReason('')
-    setError('')
+    let cancelled = false
+    queueMicrotask(() => {
+      if (cancelled) return
+      setAbsoluteQty(String(currentQty))
+      setBatchNumber(batch?.batchNumber || '')
+      setExpiryDate(batch?.expiryDate ? String(batch.expiryDate).slice(0, 10) : '')
+      setReason('')
+      setError('')
+    })
+    return () => { cancelled = true }
   }, [medicine?.id, batch?.id, currentQty, batch?.batchNumber, batch?.expiryDate])
 
   const nextQty = Number.parseInt(absoluteQty, 10)

@@ -28,17 +28,22 @@ export default function StockHistoryPage() {
   }
 
   useEffect(() => {
-    if (!token) return
-    loadRows()
-      .catch((loadError) => setError(loadError.message))
-      .finally(() => setIsLoading(false))
+    if (!token) return undefined
+    let cancelled = false
+    queueMicrotask(() => {
+      loadRows()
+        .catch((loadError) => { if (!cancelled) setError(loadError.message) })
+        .finally(() => { if (!cancelled) setIsLoading(false) })
+    })
+    return () => { cancelled = true }
   }, [token])
 
   useEffect(() => {
     const search = medicineQuery.trim()
     if (search.length < 2) {
-      setSuggestions([])
-      return undefined
+      let cancelled = false
+      queueMicrotask(() => { if (!cancelled) setSuggestions([]) })
+      return () => { cancelled = true }
     }
     let cancelled = false
     const timer = setTimeout(() => {

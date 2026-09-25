@@ -25,23 +25,30 @@ export default function MedicineCatalog({ medicines = defaultMedicines, scrollab
 
   useEffect(() => {
     const query = searchQuery.trim()
-    if (!remoteSearch || query.length < 2) return undefined
+    if (!remoteSearch || query.length < 2) {
+      let cancelled = false
+      queueMicrotask(() => { if (!cancelled) setSuggestions([]) })
+      return () => { cancelled = true }
+    }
 
     let cancelled = false
-    getMedicines({ limit: 20, search: query })
-      .then((results) => {
-        if (!cancelled) {
-          const medicines = withCategory(results)
-          setCatalogMedicines(medicines)
-          setSuggestions(medicines.slice(0, 6))
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setSuggestions([])
-      })
+    const timer = setTimeout(() => {
+      getMedicines({ limit: 20, search: query })
+        .then((results) => {
+          if (!cancelled) {
+            const medicines = withCategory(results)
+            setCatalogMedicines(medicines)
+            setSuggestions(medicines.slice(0, 6))
+          }
+        })
+        .catch(() => {
+          if (!cancelled) setSuggestions([])
+        })
+    }, 300)
 
     return () => {
       cancelled = true
+      clearTimeout(timer)
     }
   }, [remoteSearch, searchQuery])
 

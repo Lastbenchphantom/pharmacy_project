@@ -1,5 +1,4 @@
 const { createWorker } = require('tesseract.js');
-const { PDFParse } = require('pdf-parse');
 
 const SKIP_LINE = /^(total|sub\s*total|grand\s*total|cash|change|vat|tax|discount|invoice|receipt|bill|date|time|tel|phone|mobile|address|thank|welcome|qty|item|particulars|sl\.?|s\/?n|apollo\s+pharmacy)\b/i;
 const STRENGTH_RE = /(\d+(?:\.\d+)?\s*(?:mg|mcg|µg|g|ml|iu|%|gm)\b(?:\s*\/\s*\d+(?:\.\d+)?\s*(?:ml|g))?)/i;
@@ -14,19 +13,15 @@ const cleanLine = (line) => String(line || '')
 	.replace(/\s{2,}/g, ' ')
 	.trim();
 
+/**
+ * Lazy-load pdf-parse only for PDF receipts.
+ * pdf-parse@2.x pulls pdfjs-dist which needs browser DOMMatrix and crashes on Vercel/Node.
+ * pdf-parse@1.1.1 runs in Node without DOMMatrix / browser PDF.js.
+ */
 const extractPdfText = async (buffer) => {
-	const parser = new PDFParse({ data: buffer });
-	try {
-		const result = await parser.getText();
-		if (typeof result === 'string') return result;
-		if (result && typeof result.text === 'string') return result.text;
-		if (result && Array.isArray(result.pages)) {
-			return result.pages.map((page) => page?.text || '').join('\n');
-		}
-		return '';
-	} finally {
-		await parser.destroy().catch(() => {});
-	}
+	const pdfParse = require('pdf-parse');
+	const result = await pdfParse(buffer);
+	return typeof result?.text === 'string' ? result.text : '';
 };
 
 const ocrImageBuffer = async (buffer) => {
@@ -151,8 +146,19 @@ const extractReceiptItemsWithTesseract = async (file) => {
 		}
 	} catch (ocrError) {
 		if (ocrError.statusCode) throw ocrError;
-		const error = new Error(`Receipt OCR failed: ${ocrError.message || 'unknown error'}`);
-		error.statusCode = 502;
+		const message = String(ocrError.message || 'unknown error');
+		if (/DOMMatrix/i.test(message)) {
+			const error = new Error('PDF parsing is misconfigured on the server (browser PDF.js loaded in Node). Re-upload as JPG/PNG, or contact admin after the Node pdf-parse fix is deployed.');
+			error.statusCode = 502;
+			throw error;
+		}
+		const looksCorrupt = /invalid pdf|bad xref|pdf structure|password|encrypted|format error|unexpected/i.test(message);
+		const error = new Error(
+			looksCorrupt
+				? 'This PDF could not be read. Try another file or upload a JPG/PNG photo of the receipt.'
+				: `Receipt OCR failed: ${message}`,
+		);
+		error.statusCode = looksCorrupt ? 422 : 502;
 		throw error;
 	}
 

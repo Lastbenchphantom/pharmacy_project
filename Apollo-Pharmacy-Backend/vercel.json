@@ -3,15 +3,7 @@
   "builds": [
     {
       "src": "api/index.js",
-      "use": "@vercel/node",
-      "config": {
-        "includeFiles": [
-          "receiptOcr.js",
-          "node_modules/tesseract.js/**",
-          "node_modules/tesseract.js-core/**",
-          "node_modules/pdf-parse/**"
-        ]
-      }
+      "use": "@vercel/node"
     }
   ],
   "routes": [

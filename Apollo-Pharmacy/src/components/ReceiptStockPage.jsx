@@ -30,21 +30,24 @@ function MedicineTypeahead({ value, label, onSelect }) {
   const [open, setOpen] = useState(false)
 
   useEffect(() => {
-    setQuery(label || '')
+    let cancelled = false
+    queueMicrotask(() => { if (!cancelled) setQuery(label || '') })
+    return () => { cancelled = true }
   }, [label, value])
 
   useEffect(() => {
     const search = query.trim()
     if (search.length < 2) {
-      setOptions([])
-      return undefined
+      let cancelled = false
+      queueMicrotask(() => { if (!cancelled) setOptions([]) })
+      return () => { cancelled = true }
     }
     let cancelled = false
     const timer = setTimeout(() => {
       getMedicines({ limit: 15, search })
         .then((medicines) => { if (!cancelled) setOptions(medicines) })
         .catch(() => { if (!cancelled) setOptions([]) })
-    }, 250)
+    }, 300)
     return () => {
       cancelled = true
       clearTimeout(timer)
@@ -106,12 +109,17 @@ export default function ReceiptStockPage() {
 
   useEffect(() => {
     if (!file) {
-      setPreviewUrl('')
-      return undefined
+      let cancelled = false
+      queueMicrotask(() => { if (!cancelled) setPreviewUrl('') })
+      return () => { cancelled = true }
     }
     const url = URL.createObjectURL(file)
-    setPreviewUrl(url)
-    return () => URL.revokeObjectURL(url)
+    let cancelled = false
+    queueMicrotask(() => { if (!cancelled) setPreviewUrl(url) })
+    return () => {
+      cancelled = true
+      URL.revokeObjectURL(url)
+    }
   }, [file])
 
   useEffect(() => {
@@ -119,15 +127,17 @@ export default function ReceiptStockPage() {
     const params = new URLSearchParams(window.location.search)
     const receiptId = params.get('receiptId')
     if (!receiptId) {
-      setBootstrapping(false)
-      return undefined
+      let cancelled = false
+      queueMicrotask(() => { if (!cancelled) setBootstrapping(false) })
+      return () => { cancelled = true }
     }
 
     let cancelled = false
-    setBootstrapping(true)
-    setError('')
-    getStockReceipt(token, receiptId)
-      .then(async (loaded) => {
+    const boot = async () => {
+      setBootstrapping(true)
+      setError('')
+      try {
+        const loaded = await getStockReceipt(token, receiptId)
         if (cancelled) return
         setReceipt(loaded)
         if (loaded.status === 'READY_FOR_REVIEW') {
@@ -162,16 +172,16 @@ export default function ReceiptStockPage() {
             if (!cancelled) setIsWorking(false)
           }
         }
-      })
-      .catch((loadError) => {
+      } catch (loadError) {
         if (!cancelled) {
           setError(loadError.message)
           setStatus('upload')
         }
-      })
-      .finally(() => {
+      } finally {
         if (!cancelled) setBootstrapping(false)
-      })
+      }
+    }
+    queueMicrotask(boot)
 
     return () => {
       cancelled = true

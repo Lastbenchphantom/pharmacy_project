@@ -21,19 +21,24 @@ export default function MedicineFormModal({ token, medicine, onClose, onSaved })
   const [isSaving, setIsSaving] = useState(false)
 
   useEffect(() => {
-    if (medicine) {
-      setForm({
-        ...emptyForm,
-        brandName: medicine.brandName || '',
-        genericName: medicine.genericName || '',
-        manufacturer: medicine.manufacturer || '',
-        strength: medicine.strength || '',
-        singlePiecePrice: String(medicine.singlePiecePrice ?? 0),
-        fullBoxPrice: String(medicine.fullBoxPrice ?? 0),
-      })
-    } else {
-      setForm(emptyForm)
-    }
+    let cancelled = false
+    queueMicrotask(() => {
+      if (cancelled) return
+      if (medicine) {
+        setForm({
+          ...emptyForm,
+          brandName: medicine.brandName || '',
+          genericName: medicine.genericName || '',
+          manufacturer: medicine.manufacturer || '',
+          strength: medicine.strength || '',
+          singlePiecePrice: String(medicine.singlePiecePrice ?? 0),
+          fullBoxPrice: String(medicine.fullBoxPrice ?? 0),
+        })
+      } else {
+        setForm(emptyForm)
+      }
+    })
+    return () => { cancelled = true }
   }, [medicine])
 
   const updateField = (field, value) => setForm((current) => ({ ...current, [field]: value }))

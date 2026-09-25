@@ -40,7 +40,7 @@ export default function ExpiringStockTable({ items, isLoading, onEditBatch }) {
             {!isLoading && items.length === 0 && (
               <tr><td className="p-3 text-[#607487]" colSpan={6}>No expiring batches</td></tr>
             )}
-            {items.map((batch) => {
+            {!isLoading && items.map((batch) => {
               const badge = statusBadge(batch.expiryDate)
               return (
                 <tr key={batch.id} className="border-b border-[#d9e7f0] dark:border-slate-700">

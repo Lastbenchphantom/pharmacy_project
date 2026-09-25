@@ -18,7 +18,7 @@ export default function LowStockTable({ items, isLoading, onAdjust }) {
             {!isLoading && items.length === 0 && (
               <tr><td className="p-3 text-[#607487]" colSpan={3}>No low stock items</td></tr>
             )}
-            {items.map((medicine) => (
+            {!isLoading && items.map((medicine) => (
               <tr key={medicine.id} className="border-b border-[#d9e7f0] dark:border-slate-700">
                 <td className="p-2">
                   <strong className="block">{medicine.brandName}</strong>

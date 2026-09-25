@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  fetchMedicines,
   getDashboard,
   getExpiringStock,
   getLowStock,
@@ -16,6 +17,7 @@ import StockAdjustPanel from './StockAdjustPanel'
 import PushOptIn from './PushOptIn'
 
 const TOKEN_KEY = 'apollo-admin-token'
+const MEDICINE_PAGE_SIZE = 25
 
 function AdminLogin({ onLogin }) {
   const [password, setPassword] = useState('')
@@ -68,14 +70,19 @@ function AdminDashboard({ token, onLogout }) {
   const [lowStock, setLowStock] = useState([])
   const [expiring, setExpiring] = useState([])
   const [medicines, setMedicines] = useState([])
+  const [medicinePagination, setMedicinePagination] = useState({ page: 1, total: 0, totalPages: 1, limit: MEDICINE_PAGE_SIZE })
   const [medicineSearch, setMedicineSearch] = useState('')
   const [submittedSearch, setSubmittedSearch] = useState('')
   const [suggestions, setSuggestions] = useState([])
+  const [medicinesLoading, setMedicinesLoading] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
+  const [dashboardLoading, setDashboardLoading] = useState(true)
+  const [alertsLoading, setAlertsLoading] = useState(true)
   const [success, setSuccess] = useState('')
   const [error, setError] = useState('')
   const [medicineModal, setMedicineModal] = useState(null)
   const [adjustTarget, setAdjustTarget] = useState(null)
+  const medicineRequestId = useRef(0)
 
   const showSuccess = (text) => {
     setSuccess(text)
@@ -87,6 +94,8 @@ function AdminDashboard({ token, onLogout }) {
   }
 
   const refreshAlerts = useCallback(async () => {
+    setDashboardLoading(true)
+    setAlertsLoading(true)
     const [dashboardResult, lowResult, expiringResult] = await Promise.allSettled([
       getDashboard(token),
       getLowStock(token, { limit: 20 }),
@@ -95,26 +104,44 @@ function AdminDashboard({ token, onLogout }) {
     if (dashboardResult.status === 'fulfilled') setStats(dashboardResult.value)
     else if (dashboardResult.reason?.message) showError(dashboardResult.reason.message)
     if (lowResult.status === 'fulfilled') setLowStock(lowResult.value)
+    else if (lowResult.reason?.message) showError(lowResult.reason.message)
     if (expiringResult.status === 'fulfilled') setExpiring(expiringResult.value)
-    const authFail = [dashboardResult, lowResult, expiringResult].find((result) => (
-      result.status === 'rejected' && (result.reason.message.includes('session') || result.reason.message.includes('login'))
-    ))
+    else if (expiringResult.reason?.message) showError(expiringResult.reason.message)
+    const authFail = [dashboardResult, lowResult, expiringResult].find((result) => {
+      const message = result.reason?.message || ''
+      return result.status === 'rejected' && (message.includes('session') || message.includes('login'))
+    })
     if (authFail) onLogout()
+    setDashboardLoading(false)
+    setAlertsLoading(false)
   }, [token, onLogout])
 
-  const searchCatalog = async (search) => {
-    const medicineData = await getMedicines({ limit: 20, search })
-    setMedicines(medicineData)
-  }
+  const searchCatalog = useCallback(async (search, page = 1) => {
+    const requestId = ++medicineRequestId.current
+    setMedicinesLoading(true)
+    try {
+      const { items, pagination } = await fetchMedicines({ limit: MEDICINE_PAGE_SIZE, page, search })
+      if (requestId !== medicineRequestId.current) return
+      setMedicines(items)
+      setMedicinePagination(pagination)
+    } finally {
+      if (requestId === medicineRequestId.current) setMedicinesLoading(false)
+    }
+  }, [])
 
   useEffect(() => {
-    Promise.allSettled([
-      refreshAlerts(),
-      getMedicines({ limit: 10 }),
-    ]).then(([alertsResult, medicineResult]) => {
-      if (medicineResult.status === 'fulfilled') setMedicines(medicineResult.value)
-      else if (medicineResult.status === 'rejected') {
-        const message = medicineResult.reason.message || 'Failed to load medicines'
+    let cancelled = false
+    const boot = async () => {
+      const [alertsResult, medicineResult] = await Promise.allSettled([
+        refreshAlerts(),
+        fetchMedicines({ limit: MEDICINE_PAGE_SIZE, page: 1 }),
+      ])
+      if (cancelled) return
+      if (medicineResult.status === 'fulfilled') {
+        setMedicines(medicineResult.value.items)
+        setMedicinePagination(medicineResult.value.pagination)
+      } else if (medicineResult.status === 'rejected') {
+        const message = medicineResult.reason?.message || 'Failed to load medicines'
         if (message.includes('session') || message.includes('login')) onLogout()
         else showError(message)
       }
@@ -122,7 +149,12 @@ function AdminDashboard({ token, onLogout }) {
         const message = alertsResult.reason?.message || 'Failed to load admin alerts'
         if (message.includes('session') || message.includes('login')) onLogout()
       }
-    }).finally(() => setIsLoading(false))
+      setIsLoading(false)
+    }
+    queueMicrotask(boot)
+    return () => {
+      cancelled = true
+    }
   }, [token, onLogout, refreshAlerts])
 
   useEffect(() => {
@@ -144,7 +176,7 @@ function AdminDashboard({ token, onLogout }) {
     setSubmittedSearch(search)
     setSuggestions([])
     try {
-      await searchCatalog(search)
+      await searchCatalog(search, 1)
     } catch (searchError) {
       showError(searchError.message)
     }
@@ -155,7 +187,7 @@ function AdminDashboard({ token, onLogout }) {
     setSubmittedSearch(medicine.brandName)
     setSuggestions([])
     try {
-      await searchCatalog(medicine.brandName)
+      await searchCatalog(medicine.brandName, 1)
     } catch (searchError) {
       showError(searchError.message)
     }
@@ -165,6 +197,7 @@ function AdminDashboard({ token, onLogout }) {
     try {
       const result = await syncMedicines(token)
       await refreshAlerts()
+      await searchCatalog(submittedSearch, medicinePagination.page || 1)
       showSuccess(`${result.imported} new medicines imported from the Bangladesh catalog.`)
     } catch (syncError) {
       showError(syncError.message)
@@ -210,7 +243,7 @@ function AdminDashboard({ token, onLogout }) {
         {error && <p className="mt-6 rounded-xl bg-[#fff0ef] p-3 font-semibold text-[#b94f49]">{error}</p>}
 
         <div className="mt-8">
-          <DashboardStats stats={stats} isLoading={!stats} />
+          <DashboardStats stats={stats} isLoading={dashboardLoading} />
         </div>
 
         <div className="mt-4 flex flex-wrap gap-2">
@@ -238,12 +271,12 @@ function AdminDashboard({ token, onLogout }) {
         <div className="mt-6 grid gap-6 lg:grid-cols-2">
           <LowStockTable
             items={lowStock}
-            isLoading={false}
+            isLoading={alertsLoading}
             onAdjust={(medicine) => setAdjustTarget({ medicine })}
           />
           <ExpiringStockTable
             items={expiring}
-            isLoading={false}
+            isLoading={alertsLoading}
             onEditBatch={(batch) => setAdjustTarget({
               medicine: {
                 id: batch.medicineId,
@@ -257,7 +290,9 @@ function AdminDashboard({ token, onLogout }) {
 
         <section className="mt-8 rounded-3xl border border-[#d9e7f0] bg-white p-5 dark:border-slate-700 dark:bg-[#172b3d]">
           <h2 className="text-2xl font-extrabold">Live stock search</h2>
-          <p className="mt-1 text-sm text-[#607487]">Adjust stock with reason + expiry when adding. Edit metadata separately.</p>
+          <p className="mt-1 text-sm text-[#607487]">
+            Server-side search and pagination (25 per page). Adjust stock with reason + expiry when adding.
+          </p>
           <form onSubmit={searchMedicines} className="relative mt-5 flex gap-2">
             <label className="sr-only" htmlFor="medicine-search">Search medicines</label>
             <input
@@ -265,7 +300,7 @@ function AdminDashboard({ token, onLogout }) {
               className="min-w-0 flex-1 rounded-xl border border-[#d9e7f0] bg-[#f4f9fc] px-4 py-3 text-[#172b3d] outline-none focus:ring-2 focus:ring-[#2f80c0] dark:border-slate-600 dark:bg-slate-800 dark:text-white"
               value={medicineSearch}
               onChange={(event) => setMedicineSearch(event.target.value)}
-              placeholder="Search brand, generic, or manufacturer"
+              placeholder="Search brand, generic, manufacturer, or strength"
             />
             <button type="submit" className="rounded-xl bg-[#2f80c0] px-4 py-3 text-sm font-bold text-white hover:bg-[#18527f]">Search</button>
             {visibleSuggestions.length > 0 && (
@@ -280,23 +315,52 @@ function AdminDashboard({ token, onLogout }) {
             )}
           </form>
           <div className="mt-5 max-h-[55vh] overflow-y-auto pr-2">
-            <div className="grid gap-3">
-              {medicines.length === 0 && <p className="rounded-xl bg-[#f4f9fc] p-4 text-[#607487] dark:bg-slate-800">No medicines found.</p>}
-              {medicines.map((medicine) => (
-                <div key={medicine.id} className="flex flex-wrap items-end justify-between gap-3 rounded-2xl bg-[#f4f9fc] p-3 dark:bg-slate-800">
-                  <div>
-                    <strong className="block">{medicine.brandName}</strong>
-                    <span className="text-sm text-[#607487]">{medicine.genericName} · {medicine.strength}</span>
-                    <p className="mt-1 text-sm font-bold">Qty {medicine.availableQty} · Piece {medicine.singlePiecePrice} · Box {medicine.fullBoxPrice}</p>
+            {medicinesLoading && <p className="rounded-xl bg-[#f4f9fc] p-4 text-[#607487] dark:bg-slate-800">Searching medicines…</p>}
+            {!medicinesLoading && (
+              <div className="grid gap-3">
+                {medicines.length === 0 && <p className="rounded-xl bg-[#f4f9fc] p-4 text-[#607487] dark:bg-slate-800">No medicines found.</p>}
+                {medicines.map((medicine) => (
+                  <div key={medicine.id} className="flex flex-wrap items-end justify-between gap-3 rounded-2xl bg-[#f4f9fc] p-3 dark:bg-slate-800">
+                    <div>
+                      <strong className="block">{medicine.brandName}</strong>
+                      <span className="text-sm text-[#607487]">{medicine.genericName} · {medicine.strength}</span>
+                      <p className="mt-1 text-sm font-bold">Qty {medicine.availableQty} · Piece {medicine.singlePiecePrice} · Box {medicine.fullBoxPrice}</p>
+                    </div>
+                    <div className="flex gap-2">
+                      <button type="button" onClick={() => setMedicineModal(medicine)} className="rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-sm font-bold dark:border-slate-600 dark:bg-[#172b3d]">Edit</button>
+                      <button type="button" onClick={() => setAdjustTarget({ medicine })} className="rounded-lg bg-[#2f80c0] px-3 py-2 text-sm font-bold text-white hover:bg-[#18527f]">Adjust stock</button>
+                    </div>
                   </div>
-                  <div className="flex gap-2">
-                    <button type="button" onClick={() => setMedicineModal(medicine)} className="rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-sm font-bold dark:border-slate-600 dark:bg-[#172b3d]">Edit</button>
-                    <button type="button" onClick={() => setAdjustTarget({ medicine })} className="rounded-lg bg-[#2f80c0] px-3 py-2 text-sm font-bold text-white hover:bg-[#18527f]">Adjust stock</button>
-                  </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            )}
           </div>
+          {medicinePagination.totalPages > 1 && (
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+              <p className="text-sm text-[#607487]">
+                Page {medicinePagination.page} of {medicinePagination.totalPages}
+                {medicinePagination.total ? ` · ${medicinePagination.total.toLocaleString()} total` : ''}
+              </p>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  disabled={medicinesLoading || medicinePagination.page <= 1}
+                  onClick={() => searchCatalog(submittedSearch, medicinePagination.page - 1)}
+                  className="rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-sm font-bold disabled:opacity-40 dark:border-slate-600 dark:bg-[#172b3d]"
+                >
+                  Previous
+                </button>
+                <button
+                  type="button"
+                  disabled={medicinesLoading || medicinePagination.page >= medicinePagination.totalPages}
+                  onClick={() => searchCatalog(submittedSearch, medicinePagination.page + 1)}
+                  className="rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-sm font-bold disabled:opacity-40 dark:border-slate-600 dark:bg-[#172b3d]"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
         </section>
       </div>
 
@@ -326,8 +390,7 @@ function AdminDashboard({ token, onLogout }) {
           onClose={() => setAdjustTarget(null)}
           onSaved={async () => {
             await refreshAlerts()
-            if (submittedSearch) await searchCatalog(submittedSearch)
-            else setMedicines(await getMedicines({ limit: 10 }))
+            await searchCatalog(submittedSearch, medicinePagination.page || 1)
             showSuccess('Stock synced with the database.')
           }}
         />

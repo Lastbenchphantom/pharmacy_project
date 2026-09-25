@@ -7,7 +7,6 @@ const cors = require('cors');
 const nodemailer = require('nodemailer');
 const webpush = require('web-push');
 const { Prisma, PrismaClient } = require('@prisma/client');
-const { extractReceiptItemsWithTesseract } = require('../receiptOcr');
 
 const app = express();
 const DEFAULT_MEDICINE_API_URL = 'https://huggingface.co/datasets/Mahadih534/all-Bangladeshi-medicines/raw/main/medicine.csv';
@@ -21,9 +20,40 @@ if (process.env.NODE_ENV !== 'production') {
 
 /** Create missing stock/receipt tables when migrations were not applied on the remote DB. */
 let stockSchemaPromise = null;
+let medicineSearchIndexesPromise = null;
+
+const ensureMedicineSearchIndexes = async () => {
+	if (!medicineSearchIndexesPromise) {
+		medicineSearchIndexesPromise = (async () => {
+			await prisma.$executeRawUnsafe(`CREATE EXTENSION IF NOT EXISTS pg_trgm`).catch(() => {});
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Medicine_availableQty_idx" ON "Medicine"("availableQty")`).catch(() => {});
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Medicine_strength_idx" ON "Medicine"("strength")`).catch(() => {});
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Medicine_manufacturer_idx" ON "Medicine"("manufacturer")`).catch(() => {});
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Medicine_brandName_trgm_idx" ON "Medicine" USING gin ("brandName" gin_trgm_ops)`).catch(() => {});
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Medicine_genericName_trgm_idx" ON "Medicine" USING gin ("genericName" gin_trgm_ops)`).catch(() => {});
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Medicine_manufacturer_trgm_idx" ON "Medicine" USING gin ("manufacturer" gin_trgm_ops)`).catch(() => {});
+		})().catch((error) => {
+			medicineSearchIndexesPromise = null;
+			throw error;
+		});
+	}
+	return medicineSearchIndexesPromise;
+};
+
 const ensureStockSchema = async () => {
 	if (!stockSchemaPromise) {
 		stockSchemaPromise = (async () => {
+			// Fast path: tables already exist — skip heavy DDL (critical on Vercel cold starts).
+			try {
+				await prisma.$queryRaw`SELECT 1 FROM "StockReceipt" LIMIT 1`;
+				await prisma.$queryRaw`SELECT 1 FROM "StockBatch" LIMIT 1`;
+				await prisma.$queryRaw`SELECT 1 FROM "StockTransaction" LIMIT 1`;
+				await ensureMedicineSearchIndexes();
+				return;
+			} catch {
+				// Fall through and create missing tables.
+			}
+
 			await prisma.$executeRawUnsafe(`
 				CREATE TABLE IF NOT EXISTS "StockReceipt" (
 					"id" TEXT NOT NULL,
@@ -106,7 +136,6 @@ const ensureStockSchema = async () => {
 			await prisma.$executeRawUnsafe(`CREATE UNIQUE INDEX IF NOT EXISTS "StockBatch_medicineId_batchNumber_key" ON "StockBatch"("medicineId", "batchNumber")`);
 			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "StockBatch_expiryDate_idx" ON "StockBatch"("expiryDate")`);
 			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "StockBatch_medicineId_expiryDate_idx" ON "StockBatch"("medicineId", "expiryDate")`);
-			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Medicine_availableQty_idx" ON "Medicine"("availableQty")`);
 
 			await prisma.$executeRawUnsafe(`
 				CREATE TABLE IF NOT EXISTS "PushSubscription" (
@@ -140,6 +169,7 @@ const ensureStockSchema = async () => {
 			for (const statement of fkStatements) {
 				await prisma.$executeRawUnsafe(statement).catch(() => {});
 			}
+			await ensureMedicineSearchIndexes();
 		})().catch((error) => {
 			stockSchemaPromise = null;
 			throw error;
@@ -157,11 +187,31 @@ const requireStockSchema = async (_req, _res, next) => {
 	}
 };
 
-const allowedOrigins = process.env.FRONTEND_URL
-	? process.env.FRONTEND_URL.split(',').map((origin) => origin.trim())
-	: 'http://localhost:5173';
+const allowedOrigins = (() => {
+	const raw = process.env.FRONTEND_URL || 'http://localhost:5173';
+	const list = String(raw).split(',').map((origin) => origin.trim()).filter(Boolean);
+	const normalized = new Set();
+	for (const origin of list) {
+		if (/^https?:\/\//i.test(origin)) {
+			normalized.add(origin.replace(/\/$/, ''));
+		} else {
+			normalized.add(`https://${origin.replace(/\/$/, '')}`);
+			normalized.add(`http://${origin.replace(/\/$/, '')}`);
+		}
+	}
+	// Always allow local Vite during development.
+	normalized.add('http://localhost:5173');
+	normalized.add('http://127.0.0.1:5173');
+	return [...normalized];
+})();
 
-app.use(cors({ origin: allowedOrigins }));
+app.use(cors({
+	origin(origin, callback) {
+		if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+		return callback(null, false);
+	},
+	credentials: true,
+}));
 app.use(express.json({ limit: '16kb' }));
 
 const MAX_RECEIPT_SIZE = 10 * 1024 * 1024;
@@ -212,10 +262,34 @@ const rateLimit = (bucketName, maxRequests, windowMs) => (req, res, next) => {
 const parseLimitOffset = (query, defaultLimit = 50, maxLimit = 100) => {
 	const requestedLimit = Number.parseInt(query.limit, 10);
 	const requestedOffset = Number.parseInt(query.offset, 10);
+	const requestedPage = Number.parseInt(query.page, 10);
 	const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), maxLimit) : defaultLimit;
-	const offset = Number.isInteger(requestedOffset) && requestedOffset >= 0 ? requestedOffset : 0;
-	return { limit, offset };
+	if (Number.isInteger(requestedOffset) && requestedOffset >= 0) {
+		return { limit, offset: requestedOffset, page: Math.floor(requestedOffset / limit) + 1 };
+	}
+	const page = Number.isInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1;
+	return { limit, offset: (page - 1) * limit, page };
 };
+
+const MEDICINE_LIST_SELECT = Prisma.sql`
+	"id", "brandName", "genericName", "manufacturer", "strength", "availableQty",
+	"piece_price", "box_price", "createdAt", "updatedAt"
+`;
+
+const mapMedicineRow = (medicine) => ({
+	id: medicine.id,
+	brandName: medicine.brandName,
+	genericName: medicine.genericName,
+	manufacturer: medicine.manufacturer,
+	strength: medicine.strength,
+	availableQty: Number(medicine.availableQty || 0),
+	singlePiecePrice: Number(medicine.piece_price ?? medicine.singlePiecePrice ?? 0),
+	fullBoxPrice: Number(medicine.box_price ?? medicine.fullBoxPrice ?? 0),
+	createdAt: medicine.createdAt,
+	updatedAt: medicine.updatedAt,
+});
+
+const escapeIlikePattern = (value) => String(value || '').replace(/[\\%_]/g, '\\$&');
 
 const createAdminToken = () => {
 	const payload = Buffer.from(JSON.stringify({
@@ -599,7 +673,57 @@ const matchReceiptMedicine = (item, medicines) => {
 	return { matchStatus: 'MATCHED', matchedMedicineId: best.medicine.id, matchScore: best.score };
 };
 
-const extractReceiptItems = async (file) => extractReceiptItemsWithTesseract(file);
+/** Pull a small candidate set from Postgres instead of scoring against all ~21k medicines. */
+const findMedicineMatchCandidates = async (item, limit = 40) => {
+	const rawTokens = [item.brand_name, item.medicine_name, item.generic_name]
+		.filter(Boolean)
+		.flatMap((value) => normalizeMedicineText(value).split(' '))
+		.filter((token) => token.length >= 3 && !/^\d+$/.test(token));
+	const uniqueTokens = [...new Set(rawTokens)].slice(0, 4);
+	if (uniqueTokens.length === 0) {
+		const fallback = normalizeMedicineText(item.medicine_name || item.brand_name || '').slice(0, 24);
+		if (fallback.length < 2) return [];
+		uniqueTokens.push(fallback);
+	}
+
+	const conditions = uniqueTokens.map((token) => {
+		const pattern = `%${escapeIlikePattern(token)}%`;
+		return Prisma.sql`(
+			"brandName" ILIKE ${pattern} ESCAPE '\\'
+			OR "genericName" ILIKE ${pattern} ESCAPE '\\'
+			OR "manufacturer" ILIKE ${pattern} ESCAPE '\\'
+			OR "strength" ILIKE ${pattern} ESCAPE '\\'
+		)`;
+	});
+
+	const strength = typeof item.strength === 'string' ? item.strength.trim() : '';
+	if (strength) {
+		const strengthPattern = `%${escapeIlikePattern(strength)}%`;
+		conditions.push(Prisma.sql`"strength" ILIKE ${strengthPattern} ESCAPE '\\'`);
+	}
+
+	return prisma.$queryRaw(Prisma.sql`
+		SELECT "id", "brandName", "genericName", "strength", "availableQty"
+		FROM "Medicine"
+		WHERE ${Prisma.join(conditions, ' OR ')}
+		ORDER BY "brandName" ASC
+		LIMIT ${limit}
+	`);
+};
+
+const matchReceiptItemAgainstDatabase = async (item) => {
+	const candidates = await findMedicineMatchCandidates(item, 40);
+	if (candidates.length === 0) {
+		return { matchStatus: 'NEEDS_MANUAL', matchedMedicineId: null, matchScore: 0 };
+	}
+	return matchReceiptMedicine(item, candidates);
+};
+
+const extractReceiptItems = async (file) => {
+	// Lazy-load OCR so public medicine routes do not pull tesseract.js on cold start.
+	const { extractReceiptItemsWithTesseract } = require('../receiptOcr');
+	return extractReceiptItemsWithTesseract(file);
+};
 
 const getReceiptDetails = async (receiptId) => {
 	const receipts = await prisma.$queryRaw(Prisma.sql`SELECT "id", "fileName", "mimeType", "status", "uploadedBy", "uploadedAt", "processedAt", "confirmedBy", "confirmedAt", "errorMessage" FROM "StockReceipt" WHERE "id" = ${receiptId}`);
@@ -629,37 +753,81 @@ app.post('/api/admin/login', rateLimit('admin-login', 5, 60_000), (req, res) => 
 
 app.get('/api/medicines', async (req, res, next) => {
 	try {
-		const { limit, offset } = parseLimitOffset(req.query, 50, 100);
+		const { limit, offset, page } = parseLimitOffset(req.query, 25, 100);
 		const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
-		const searchPattern = search ? `%${search}%` : null;
+		const searchPattern = search ? `%${escapeIlikePattern(search)}%` : null;
+		const wantFeatured = req.query.random === 'true' && !searchPattern;
+
 		let medicines;
-		if (req.query.random === 'true' && !search) {
+		let total;
+
+		if (wantFeatured) {
+			// Avoid ORDER BY RANDOM() full-table sort on 21k rows.
 			medicines = await prisma.$queryRaw(Prisma.sql`
-				SELECT * FROM "Medicine" ORDER BY RANDOM() LIMIT ${limit}
+				SELECT ${MEDICINE_LIST_SELECT} FROM "Medicine"
+				WHERE "availableQty" > 0
+				ORDER BY "updatedAt" DESC
+				LIMIT ${limit}
 			`);
+			if (medicines.length < limit) {
+				const remaining = limit - medicines.length;
+				const extras = await prisma.$queryRaw(Prisma.sql`
+					SELECT ${MEDICINE_LIST_SELECT} FROM "Medicine"
+					ORDER BY "brandName" ASC
+					LIMIT ${remaining}
+				`);
+				const seen = new Set(medicines.map((row) => row.id));
+				for (const row of extras) {
+					if (!seen.has(row.id)) medicines.push(row);
+				}
+			}
+			total = medicines.length;
 		} else if (searchPattern) {
+			const whereSql = Prisma.sql`
+				"brandName" ILIKE ${searchPattern} ESCAPE '\\'
+				OR "genericName" ILIKE ${searchPattern} ESCAPE '\\'
+				OR "manufacturer" ILIKE ${searchPattern} ESCAPE '\\'
+				OR "strength" ILIKE ${searchPattern} ESCAPE '\\'
+			`;
+			const [countRow] = await prisma.$queryRaw(Prisma.sql`
+				SELECT COUNT(*)::int AS "count" FROM "Medicine" WHERE ${whereSql}
+			`);
+			total = Number(countRow?.count || 0);
 			medicines = await prisma.$queryRaw(Prisma.sql`
-				SELECT * FROM "Medicine"
-				WHERE "brandName" ILIKE ${searchPattern}
-					OR "genericName" ILIKE ${searchPattern}
-					OR "manufacturer" ILIKE ${searchPattern}
-				ORDER BY "brandName" ASC, "genericName" ASC
+				SELECT ${MEDICINE_LIST_SELECT} FROM "Medicine"
+				WHERE ${whereSql}
+				ORDER BY
+					CASE
+						WHEN "brandName" ILIKE ${`${escapeIlikePattern(search)}%`} ESCAPE '\\' THEN 0
+						WHEN "brandName" ILIKE ${searchPattern} ESCAPE '\\' THEN 1
+						WHEN "genericName" ILIKE ${searchPattern} ESCAPE '\\' THEN 2
+						ELSE 3
+					END,
+					"brandName" ASC, "genericName" ASC
 				LIMIT ${limit} OFFSET ${offset}
 			`);
 		} else {
+			const [countRow] = await prisma.$queryRaw(Prisma.sql`SELECT COUNT(*)::int AS "count" FROM "Medicine"`);
+			total = Number(countRow?.count || 0);
 			medicines = await prisma.$queryRaw(Prisma.sql`
-				SELECT * FROM "Medicine"
+				SELECT ${MEDICINE_LIST_SELECT} FROM "Medicine"
 				ORDER BY "brandName" ASC, "genericName" ASC
 				LIMIT ${limit} OFFSET ${offset}
 			`);
 		}
-		medicines = medicines.map((medicine) => ({
-			...medicine,
-			singlePiecePrice: Number(medicine.piece_price ?? medicine.singlePiecePrice ?? 0),
-			fullBoxPrice: Number(medicine.box_price ?? medicine.fullBoxPrice ?? 0),
-		}));
 
-		res.json(serializeDatabaseValue(medicines));
+		const items = medicines.map(mapMedicineRow);
+		const totalPages = Math.max(1, Math.ceil(total / limit));
+		res.json(serializeDatabaseValue({
+			items,
+			pagination: {
+				page,
+				limit,
+				offset,
+				total,
+				totalPages,
+			},
+		}));
 	} catch (error) {
 		next(error);
 	}
@@ -693,11 +861,14 @@ app.post('/api/stock/receipt/process', requireAdmin, requireStockSchema, rateLim
 		const fileData = receipt.fileData;
 		const fileBuffer = Buffer.isBuffer(fileData) ? fileData : Buffer.from(fileData);
 		const extractedItems = await extractReceiptItems({ buffer: fileBuffer, mimetype: receipt.mimeType, originalname: receipt.fileName });
-		const medicines = await prisma.$queryRaw(Prisma.sql`SELECT "id", "brandName", "genericName", "strength", "availableQty" FROM "Medicine"`);
+		const matchedItems = [];
+		for (const extractedItem of extractedItems) {
+			const match = await matchReceiptItemAgainstDatabase(extractedItem);
+			matchedItems.push({ extractedItem, match });
+		}
 		await prisma.$transaction(async (tx) => {
 			await tx.$executeRaw(Prisma.sql`DELETE FROM "StockReceiptItem" WHERE "receiptId" = ${receiptId}`);
-			for (const extractedItem of extractedItems) {
-				const match = matchReceiptMedicine(extractedItem, medicines);
+			for (const { extractedItem, match } of matchedItems) {
 				const quantity = Number.isInteger(extractedItem.quantity) && extractedItem.quantity >= 0 ? extractedItem.quantity : null;
 				const confidence = Number.isFinite(Number(extractedItem.confidence)) ? Math.min(Math.max(Number(extractedItem.confidence), 0), 1) : 0;
 				await tx.$executeRaw(Prisma.sql`
@@ -886,10 +1057,16 @@ app.patch('/api/admin/update-stock', requireAdmin, requireStockSchema, async (re
 
 	try {
 		const result = await prisma.$transaction(async (tx) => {
-			const medicines = await tx.$queryRaw(Prisma.sql`SELECT * FROM "Medicine" WHERE "id" = ${String(medicineId)} FOR UPDATE`);
+			const medicines = await tx.$queryRaw(Prisma.sql`
+				SELECT "id", "availableQty", "piece_price", "box_price", "brandName", "genericName", "manufacturer", "strength", "createdAt", "updatedAt"
+				FROM "Medicine" WHERE "id" = ${String(medicineId)} FOR UPDATE
+			`);
 			if (medicines.length === 0) return { type: 'missing' };
 			await seedLegacyStockBatchIfNeeded(tx, String(medicineId));
-			const refreshed = await tx.$queryRaw(Prisma.sql`SELECT * FROM "Medicine" WHERE "id" = ${String(medicineId)}`);
+			const refreshed = await tx.$queryRaw(Prisma.sql`
+				SELECT "id", "availableQty", "piece_price", "box_price", "brandName", "genericName", "manufacturer", "strength", "createdAt", "updatedAt"
+				FROM "Medicine" WHERE "id" = ${String(medicineId)}
+			`);
 			const medicine = refreshed[0];
 			const previousStock = Number(medicine.availableQty);
 			const qtyDelta = parsedQty - previousStock;
@@ -937,30 +1114,20 @@ app.patch('/api/admin/update-stock', requireAdmin, requireStockSchema, async (re
 				});
 			}
 
-			const priceColumns = await tx.$queryRaw(Prisma.sql`
-				SELECT "column_name" FROM information_schema.columns
-				WHERE "table_schema" = 'public' AND "table_name" = 'Medicine'
-				AND "column_name" IN ('piece_price', 'box_price')
+			// Schema is controlled by Prisma — piece_price / box_price always exist. No information_schema probe.
+			const updatedRows = await tx.$queryRaw(Prisma.sql`
+				UPDATE "Medicine"
+				SET "piece_price" = ${parsedPiecePrice}, "box_price" = ${parsedBoxPrice}, "updatedAt" = NOW()
+				WHERE "id" = ${String(medicineId)}
+				RETURNING "id", "availableQty", "piece_price", "box_price", "brandName", "genericName", "manufacturer", "strength", "createdAt", "updatedAt"
 			`);
-			const pricesSaved = priceColumns.length === 2;
-			const updatedRows = pricesSaved
-				? await tx.$queryRaw(Prisma.sql`
-					UPDATE "Medicine"
-					SET "piece_price" = ${parsedPiecePrice}, "box_price" = ${parsedBoxPrice}, "updatedAt" = NOW()
-					WHERE "id" = ${String(medicineId)} RETURNING *
-				`)
-				: await tx.$queryRaw(Prisma.sql`
-					UPDATE "Medicine" SET "updatedAt" = NOW() WHERE "id" = ${String(medicineId)} RETURNING *
-				`);
-			return { type: 'ok', medicine: updatedRows[0], pricesSaved };
+			return { type: 'ok', medicine: updatedRows[0], pricesSaved: true };
 		});
 
 		if (result.type === 'missing') return res.status(404).json({ error: 'Medicine not found' });
 		const medicine = result.medicine;
 		res.json(serializeDatabaseValue({
-			...medicine,
-			singlePiecePrice: Number(medicine.piece_price ?? medicine.singlePiecePrice ?? 0),
-			fullBoxPrice: Number(medicine.box_price ?? medicine.fullBoxPrice ?? 0),
+			...mapMedicineRow(medicine),
 			pricesSaved: result.pricesSaved,
 		}));
 	} catch (error) {
@@ -1078,30 +1245,41 @@ app.get('/api/admin/dashboard', requireAdmin, requireStockSchema, async (_req, r
 		const warningDate = new Date(today);
 		warningDate.setUTCDate(warningDate.getUTCDate() + resolvedExpiryWarningDays);
 
-		const [medicineCount] = await prisma.$queryRaw(Prisma.sql`SELECT COUNT(*)::int AS "count" FROM "Medicine"`);
-		const [lowStock] = await prisma.$queryRaw(Prisma.sql`
-			SELECT COUNT(*)::int AS "count" FROM "Medicine" WHERE "availableQty" <= ${resolvedLowStockThreshold}
-		`);
-		const [expiringSoon] = await prisma.$queryRaw(Prisma.sql`
-			SELECT COUNT(*)::int AS "count" FROM "StockBatch"
-			WHERE "quantity" > 0 AND "expiryDate" IS NOT NULL
-				AND "expiryDate" >= ${today} AND "expiryDate" <= ${warningDate}
-		`);
-		const [expired] = await prisma.$queryRaw(Prisma.sql`
-			SELECT COUNT(*)::int AS "count" FROM "StockBatch"
-			WHERE "quantity" > 0 AND "expiryDate" IS NOT NULL AND "expiryDate" < ${today}
-		`);
-		const [pendingReceipts] = await prisma.$queryRaw(Prisma.sql`
-			SELECT COUNT(*)::int AS "count" FROM "StockReceipt"
-			WHERE "status" IN ('PROCESSING', 'READY_FOR_REVIEW', 'FAILED')
-		`);
-		const recentTransactions = await prisma.$queryRaw(Prisma.sql`
-			SELECT t.*, m."brandName", m."strength"
-			FROM "StockTransaction" t
-			LEFT JOIN "Medicine" m ON m."id" = t."medicineId"
-			ORDER BY t."createdAt" DESC
-			LIMIT 10
-		`);
+		const [
+			[medicineCount],
+			[lowStock],
+			[expiringSoon],
+			[expired],
+			[pendingReceipts],
+			recentTransactions,
+		] = await Promise.all([
+			prisma.$queryRaw(Prisma.sql`SELECT COUNT(*)::int AS "count" FROM "Medicine"`),
+			prisma.$queryRaw(Prisma.sql`
+				SELECT COUNT(*)::int AS "count" FROM "Medicine" WHERE "availableQty" <= ${resolvedLowStockThreshold}
+			`),
+			prisma.$queryRaw(Prisma.sql`
+				SELECT COUNT(*)::int AS "count" FROM "StockBatch"
+				WHERE "quantity" > 0 AND "expiryDate" IS NOT NULL
+					AND "expiryDate" >= ${today} AND "expiryDate" <= ${warningDate}
+			`),
+			prisma.$queryRaw(Prisma.sql`
+				SELECT COUNT(*)::int AS "count" FROM "StockBatch"
+				WHERE "quantity" > 0 AND "expiryDate" IS NOT NULL AND "expiryDate" < ${today}
+			`),
+			prisma.$queryRaw(Prisma.sql`
+				SELECT COUNT(*)::int AS "count" FROM "StockReceipt"
+				WHERE "status" IN ('PROCESSING', 'READY_FOR_REVIEW', 'FAILED')
+			`),
+			prisma.$queryRaw(Prisma.sql`
+				SELECT t."id", t."medicineId", t."transactionType", t."quantity", t."previousStock", t."newStock",
+					t."batchNumber", t."expiryDate", t."reason", t."createdBy", t."createdAt",
+					m."brandName", m."strength"
+				FROM "StockTransaction" t
+				LEFT JOIN "Medicine" m ON m."id" = t."medicineId"
+				ORDER BY t."createdAt" DESC
+				LIMIT 10
+			`),
+		]);
 
 		res.json(serializeDatabaseValue({
 			totalMedicines: Number(medicineCount.count || 0),
@@ -1124,16 +1302,12 @@ app.get('/api/admin/stock/low', requireAdmin, requireStockSchema, async (req, re
 		const threshold = Number.isInteger(thresholdRaw) && thresholdRaw >= 0 ? thresholdRaw : resolvedLowStockThreshold;
 		const { limit, offset } = parseLimitOffset(req.query, 50, 200);
 		const rows = await prisma.$queryRaw(Prisma.sql`
-			SELECT * FROM "Medicine"
+			SELECT ${MEDICINE_LIST_SELECT} FROM "Medicine"
 			WHERE "availableQty" <= ${threshold}
 			ORDER BY "availableQty" ASC, "brandName" ASC
 			LIMIT ${limit} OFFSET ${offset}
 		`);
-		res.json(serializeDatabaseValue(rows.map((medicine) => ({
-			...medicine,
-			singlePiecePrice: Number(medicine.piece_price ?? medicine.singlePiecePrice ?? 0),
-			fullBoxPrice: Number(medicine.box_price ?? medicine.fullBoxPrice ?? 0),
-		}))));
+		res.json(serializeDatabaseValue(rows.map(mapMedicineRow)));
 	} catch (error) {
 		next(error);
 	}
@@ -1563,29 +1737,64 @@ app.post('/api/admin/medicines/sync', requireAdmin, async (_req, res, next) => {
 
 		let imported = 0;
 		let skipped = 0;
-		for (let index = 0; index < records.length; index += 25) {
-			const batch = records.slice(index, index + 25);
-			const results = await Promise.all(batch.map(async (item) => {
-				const brandName = String(item.brandName || item.brand || item.name || '').trim();
-				const strength = String(item.strength || item.dosage || 'Standard').trim();
-				if (!brandName) return 'skipped';
-				try {
-					const existing = await prisma.$queryRaw(Prisma.sql`
-						SELECT "id" FROM "Medicine" WHERE "brandName" = ${brandName} AND "strength" = ${strength} LIMIT 1
-					`);
-					if (existing.length > 0) return 'skipped';
-					await prisma.$executeRaw(Prisma.sql`
-						INSERT INTO "Medicine" ("id", "brandName", "genericName", "manufacturer", "strength", "availableQty", "createdAt", "updatedAt")
-						VALUES (${crypto.randomUUID()}, ${brandName}, ${String(item.genericName || item.generic || 'Generic Formula').trim()}, ${String(item.manufacturer || item.company || 'Bangladeshi Pharma').trim()}, ${strength}, 0, NOW(), NOW())
-					`);
-					return 'imported';
-				} catch (rowError) {
-					console.error(`Skipping medicine import for ${brandName}:`, rowError.message);
-					return 'skipped';
+		const prepared = [];
+		for (const item of records) {
+			const brandName = String(item.brandName || item.brand || item.name || '').trim();
+			const strength = String(item.strength || item.dosage || 'Standard').trim();
+			if (!brandName) {
+				skipped += 1;
+				continue;
+			}
+			prepared.push({
+				brandName,
+				genericName: String(item.genericName || item.generic || 'Generic Formula').trim() || 'Generic Formula',
+				manufacturer: String(item.manufacturer || item.company || 'Bangladeshi Pharma').trim() || 'Bangladeshi Pharma',
+				strength,
+			});
+		}
+
+		// One round-trip for existing keys instead of per-row SELECT.
+		const existingRows = await prisma.$queryRaw(Prisma.sql`SELECT "brandName", "strength" FROM "Medicine"`);
+		const existingKeys = new Set(existingRows.map((row) => `${row.brandName}::${row.strength}`));
+		const toInsert = [];
+		for (const item of prepared) {
+			const key = `${item.brandName}::${item.strength}`;
+			if (existingKeys.has(key)) {
+				skipped += 1;
+				continue;
+			}
+			existingKeys.add(key);
+			toInsert.push(item);
+		}
+
+		const BATCH_SIZE = 100;
+		for (let index = 0; index < toInsert.length; index += BATCH_SIZE) {
+			const batch = toInsert.slice(index, index + BATCH_SIZE);
+			const values = batch.map((item) => Prisma.sql`(
+				${crypto.randomUUID()}, ${item.brandName}, ${item.genericName}, ${item.manufacturer}, ${item.strength},
+				0, 0, 0, NOW(), NOW()
+			)`);
+			try {
+				await prisma.$executeRaw(Prisma.sql`
+					INSERT INTO "Medicine" ("id", "brandName", "genericName", "manufacturer", "strength", "availableQty", "piece_price", "box_price", "createdAt", "updatedAt")
+					VALUES ${Prisma.join(values)}
+				`);
+				imported += batch.length;
+			} catch (batchError) {
+				console.error('Batch medicine import failed, falling back to row inserts:', batchError.message);
+				for (const item of batch) {
+					try {
+						await prisma.$executeRaw(Prisma.sql`
+							INSERT INTO "Medicine" ("id", "brandName", "genericName", "manufacturer", "strength", "availableQty", "piece_price", "box_price", "createdAt", "updatedAt")
+							VALUES (${crypto.randomUUID()}, ${item.brandName}, ${item.genericName}, ${item.manufacturer}, ${item.strength}, 0, 0, 0, NOW(), NOW())
+						`);
+						imported += 1;
+					} catch (rowError) {
+						console.error(`Skipping medicine import for ${item.brandName}:`, rowError.message);
+						skipped += 1;
+					}
 				}
-			}));
-			imported += results.filter((result) => result === 'imported').length;
-			skipped += results.length - results.filter((result) => result === 'imported').length;
+			}
 		}
 		res.json({ imported, skipped, total: records.length });
 	} catch (error) {
