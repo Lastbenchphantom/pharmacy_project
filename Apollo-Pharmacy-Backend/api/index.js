@@ -737,7 +737,7 @@ const getReceiptDetails = async (receiptId) => {
 };
 
 app.get('/api/health', (_req, res) => {
-	res.json({ ok: true });
+	res.json({ ok: true, service: 'pharmacy-api' });
 });
 
 app.post('/api/admin/login', rateLimit('admin-login', 5, 60_000), (req, res) => {
