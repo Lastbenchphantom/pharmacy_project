@@ -112,7 +112,6 @@ export default function ReceiptListPage() {
           {isLoading && <p className="rounded-2xl border border-[#d9e7f0] bg-white p-4 text-[#607487] dark:border-slate-700 dark:bg-[#172b3d]">Loading receipts…</p>}
           {!isLoading && rows.length === 0 && <p className="rounded-2xl border border-[#d9e7f0] bg-white p-4 text-[#607487] dark:border-slate-700 dark:bg-[#172b3d]">No receipts found</p>}
           {rows.map((receipt) => {
-            const canOpen = receipt.status !== 'CONFIRMED'
             const canDelete = receipt.status !== 'CONFIRMED'
             const canRetry = receipt.status === 'FAILED'
             return (
@@ -121,8 +120,12 @@ export default function ReceiptListPage() {
                   <div>
                     <p className="font-bold break-all">{receipt.fileName}</p>
                     <p className="mt-1 text-xs text-[#607487]">
+                      ID {receipt.id?.slice(0, 8)}…
+                      {receipt.supplierName ? ` · ${receipt.supplierName}` : ''}
+                    </p>
+                    <p className="mt-1 text-xs text-[#607487]">
                       {receipt.uploadedAt ? new Date(receipt.uploadedAt).toLocaleString() : '—'}
-                      {receipt.uploadedBy ? ` · ${receipt.uploadedBy}` : ''}
+                      {receipt.total != null ? ` · Total ${receipt.total}` : ''}
                     </p>
                   </div>
                   <span className="rounded-lg bg-[#e7f4fc] px-2 py-1 text-xs font-bold text-[#18527f] dark:bg-slate-700 dark:text-slate-100">
@@ -133,16 +136,12 @@ export default function ReceiptListPage() {
                   <p className="mt-3 text-sm font-semibold text-[#b94f49]">{receipt.errorMessage}</p>
                 )}
                 <div className="mt-4 flex flex-wrap gap-2">
-                  {canOpen ? (
-                    <a
-                      href={`/admin/stock-receipt?receiptId=${encodeURIComponent(receipt.id)}`}
-                      className="inline-flex min-h-10 items-center rounded-lg bg-[#2f80c0] px-3 py-2 text-xs font-bold text-white hover:bg-[#18527f]"
-                    >
-                      {receipt.status === 'READY_FOR_REVIEW' ? 'Open review' : 'Open'}
-                    </a>
-                  ) : (
-                    <span className="inline-flex min-h-10 items-center text-xs text-[#607487]">Confirmed</span>
-                  )}
+                  <a
+                    href={`/admin/stock-receipt?receiptId=${encodeURIComponent(receipt.id)}`}
+                    className="inline-flex min-h-10 items-center rounded-lg bg-[#2f80c0] px-3 py-2 text-xs font-bold text-white hover:bg-[#18527f]"
+                  >
+                    {receipt.status === 'CONFIRMED' ? 'View' : (receipt.status === 'READY_FOR_REVIEW' ? 'Open review' : 'Open')}
+                  </a>
                   {canRetry && (
                     <button
                       type="button"
@@ -174,11 +173,11 @@ export default function ReceiptListPage() {
           <table className="min-w-full w-full text-left text-sm">
             <thead>
               <tr className="border-b border-[#d9e7f0] text-xs uppercase tracking-wide text-[#607487]">
+                <th className="p-2">ID</th>
+                <th className="p-2">Supplier</th>
                 <th className="p-2">Uploaded</th>
-                <th className="p-2">File</th>
                 <th className="p-2">Status</th>
-                <th className="p-2">By</th>
-                <th className="p-2">Error</th>
+                <th className="p-2">Total</th>
                 <th className="p-2">Action</th>
               </tr>
             </thead>
@@ -186,28 +185,24 @@ export default function ReceiptListPage() {
               {isLoading && <tr><td className="p-3 text-[#607487]" colSpan={6}>Loading receipts…</td></tr>}
               {!isLoading && rows.length === 0 && <tr><td className="p-3 text-[#607487]" colSpan={6}>No receipts found</td></tr>}
               {rows.map((receipt) => {
-                const canOpen = receipt.status !== 'CONFIRMED'
+                const canOpen = true
                 const canDelete = receipt.status !== 'CONFIRMED'
                 const canRetry = receipt.status === 'FAILED'
                 return (
                   <tr key={receipt.id} className="border-b border-[#d9e7f0] dark:border-slate-700">
+                    <td className="p-2 font-mono text-xs" title={receipt.id}>{receipt.id?.slice(0, 8)}…</td>
+                    <td className="p-2 max-w-[160px] break-words">{receipt.supplierName || receipt.fileName || '—'}</td>
                     <td className="p-2 whitespace-nowrap">{receipt.uploadedAt ? new Date(receipt.uploadedAt).toLocaleString() : '—'}</td>
-                    <td className="p-2 max-w-[220px] break-words">{receipt.fileName}</td>
                     <td className="p-2 font-bold whitespace-nowrap">{statusLabel(receipt.status)}</td>
-                    <td className="p-2">{receipt.uploadedBy || '—'}</td>
-                    <td className="p-2 max-w-[240px] break-words text-[#b94f49]">{receipt.errorMessage || '—'}</td>
+                    <td className="p-2">{receipt.total != null ? receipt.total : '—'}</td>
                     <td className="p-2">
                       <div className="flex flex-wrap gap-2">
-                        {canOpen ? (
-                          <a
-                            href={`/admin/stock-receipt?receiptId=${encodeURIComponent(receipt.id)}`}
-                            className="inline-flex min-h-9 items-center rounded-lg bg-[#2f80c0] px-3 py-1.5 text-xs font-bold text-white hover:bg-[#18527f]"
-                          >
-                            {receipt.status === 'READY_FOR_REVIEW' ? 'Open review' : 'Open'}
-                          </a>
-                        ) : (
-                          <span className="text-xs text-[#607487]">Confirmed</span>
-                        )}
+                        <a
+                          href={`/admin/stock-receipt?receiptId=${encodeURIComponent(receipt.id)}`}
+                          className="inline-flex min-h-9 items-center rounded-lg bg-[#2f80c0] px-3 py-1.5 text-xs font-bold text-white hover:bg-[#18527f]"
+                        >
+                          {receipt.status === 'CONFIRMED' ? 'View' : (receipt.status === 'READY_FOR_REVIEW' ? 'Open review' : 'Open')}
+                        </a>
                         {canRetry && (
                           <button
                             type="button"

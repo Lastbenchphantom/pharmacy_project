@@ -60,7 +60,18 @@ const asArray = (data) => {
 }
 
 /** Paginated medicine fetch. Never requests unbounded catalogs. */
-export const fetchMedicines = async ({ limit = 25, page, offset, random = false, search = '' } = {}) => {
+export const fetchMedicines = async ({
+  limit = 25,
+  page,
+  offset,
+  random = false,
+  search = '',
+  dosageForm,
+  type,
+  category,
+  includeInactive = false,
+  stockStatus,
+} = {}) => {
   const cappedLimit = Math.min(Math.max(Number(limit) || 25, 1), 100)
   const data = await request(withQuery('/medicines', {
     limit: cappedLimit,
@@ -68,6 +79,9 @@ export const fetchMedicines = async ({ limit = 25, page, offset, random = false,
     offset,
     random: random ? 'true' : undefined,
     search: search || undefined,
+    dosageForm: dosageForm || type || category || undefined,
+    includeInactive: includeInactive ? 'true' : undefined,
+    stockStatus: stockStatus || undefined,
   }))
   const items = asArray(data)
   const pagination = data?.pagination || {
@@ -127,10 +141,10 @@ export const retryStockReceipt = (token, receiptId) => request('/stock/receipt/r
 
 export const getStockReceipt = (token, receiptId) => request(`/stock/receipt/${receiptId}`, { token })
 
-export const confirmStockReceipt = (token, receiptId, items) => request('/stock/receipt/confirm', {
+export const confirmStockReceipt = (token, receiptId, items, receipt = undefined) => request('/stock/receipt/confirm', {
   method: 'POST',
   token,
-  body: JSON.stringify({ receiptId, items }),
+  body: JSON.stringify({ receiptId, items, ...(receipt ? { receipt } : {}) }),
 })
 
 export const deleteReceipt = (token, receiptId) => request(`/admin/receipts/${encodeURIComponent(receiptId)}`, {
@@ -183,10 +197,23 @@ export const createMedicine = (token, payload) => request('/admin/medicines', {
   body: JSON.stringify(payload),
 })
 
+export const findSimilarMedicines = async (token, params = {}) => {
+  const data = await request(withQuery('/admin/medicines/similar', params), { token })
+  return {
+    message: data.message || '',
+    similar: asArray(data.similar || data),
+  }
+}
+
 export const updateMedicine = (token, medicineId, payload) => request(`/admin/medicines/${medicineId}`, {
   method: 'PATCH',
   token,
   body: JSON.stringify(payload),
+})
+
+export const deactivateMedicine = (token, medicineId) => request(`/admin/medicines/${encodeURIComponent(medicineId)}`, {
+  method: 'DELETE',
+  token,
 })
 
 export const sendExpiryAlertEmail = (token, { days } = {}) => request('/admin/alerts/expiry/send', {

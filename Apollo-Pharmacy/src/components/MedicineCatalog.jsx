@@ -21,7 +21,10 @@ export default function MedicineCatalog({ medicines = defaultMedicines, scrollab
   const medicinesToDisplay = catalogMedicines || medicines
   const categoryFilters = ['All', ...new Set(medicinesToDisplay.map((item) => item.category))]
 
-  const withCategory = (items) => items.map((medicine) => ({ ...medicine, category: medicine.category || 'General Care' }))
+  const withCategory = (items) => items.map((medicine) => ({
+    ...medicine,
+    category: medicine.dosageForm || medicine.type || medicine.category || 'Other',
+  }))
 
   useEffect(() => {
     const query = searchQuery.trim()

@@ -7,6 +7,35 @@ const QTY_UNIT_RE = /\b(\d{1,5})\s*(?:x|pcs?|pieces?|tab(?:let)?s?|cap(?:sule)?s
 const BATCH_RE = /(?:batch|b(?:atch)?[\s.\-]*no\.?|lot)[:\s#]*([A-Za-z0-9\-./]+)/i;
 const EXPIRY_RE = /(?:exp(?:iry)?|exp\.?\s*date|use\s*before)[:\s]*([0-9]{1,2}[\/\-.][0-9]{1,2}[\/\-.][0-9]{2,4}|[0-9]{1,2}[\/\-.][0-9]{2,4}|[A-Za-z]{3,9}[\s\-\/]?[0-9]{2,4}|[0-9]{4}-[0-9]{2}-[0-9]{2})/i;
 const PRICE_RE = /(?:tk\.?|bdt|৳)\s*(\d+(?:\.\d{1,2})?)\b/i;
+const DOSAGE_FORM_RE = /\b(tablets?|capsules?|syrups?|suspensions?|injections?|salines?|creams?|ointments?|drops?|inhalers?|powders?|sachets?)\b/i;
+const MANUFACTURER_RE = /(?:manufacturer|mfr\.?|company|made\s+by)[:\s]+([A-Za-z][A-Za-z0-9 .&-]{1,40})/i;
+
+const DOSAGE_FORM_MAP = {
+	tablet: 'Tablet',
+	tablets: 'Tablet',
+	capsule: 'Capsule',
+	capsules: 'Capsule',
+	syrup: 'Syrup',
+	syrups: 'Syrup',
+	suspension: 'Suspension',
+	suspensions: 'Suspension',
+	injection: 'Injection',
+	injections: 'Injection',
+	saline: 'Saline',
+	salines: 'Saline',
+	cream: 'Cream',
+	creams: 'Cream',
+	ointment: 'Ointment',
+	ointments: 'Ointment',
+	drop: 'Drops',
+	drops: 'Drops',
+	inhaler: 'Inhaler',
+	inhalers: 'Inhaler',
+	powder: 'Powder',
+	powders: 'Powder',
+	sachet: 'Sachet',
+	sachets: 'Sachet',
+};
 
 /** Keep OCR under typical Vercel serverless limits so failures can mark FAILED before hard kill. */
 const OCR_IMAGE_TIMEOUT_MS = Number.parseInt(process.env.RECEIPT_OCR_TIMEOUT_MS, 10) || 45_000;
@@ -37,6 +66,12 @@ const logOcrStep = (step, startedAt, extra = {}) => {
 	console.info('[receipt-ocr]', { step, elapsedMs, ...extra });
 };
 
+const parseMoney = (raw) => {
+	if (raw == null) return null;
+	const parsed = Number(String(raw).replace(/,/g, ''));
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+};
+
 /**
  * Lazy-load pdf-parse only for PDF receipts.
  * pdf-parse@2.x pulls pdfjs-dist which needs browser DOMMatrix and crashes on Vercel/Node.
@@ -57,7 +92,7 @@ const ocrImageBuffer = async (buffer, timeoutMs = OCR_IMAGE_TIMEOUT_MS) => {
 		const text = await withTimeout(
 			worker.recognize(buffer).then(({ data }) => data?.text || ''),
 			timeoutMs,
-			'Receipt processing timed out. Please retry.',
+			'Receipt processing took too long. Please try again.',
 		);
 		return text;
 	} finally {
@@ -65,6 +100,50 @@ const ocrImageBuffer = async (buffer, timeoutMs = OCR_IMAGE_TIMEOUT_MS) => {
 	}
 };
 
+/** Extract receipt-level header fields when visible. Missing values stay null — never invented. */
+const parseReceiptHeader = (rawText) => {
+	const text = String(rawText || '');
+	const lines = text.split(/\r?\n/).map(cleanLine).filter(Boolean);
+
+	let supplierName = null;
+	for (const line of lines.slice(0, 8)) {
+		if (SKIP_LINE.test(line)) continue;
+		if (/^\d+$/.test(line)) continue;
+		if (line.length >= 3 && line.length <= 60 && !STRENGTH_RE.test(line)) {
+			supplierName = line;
+			break;
+		}
+	}
+
+	const invoiceMatch = text.match(/(?:invoice|inv|receipt|bill)[\s.#:—-]*([A-Za-z0-9\-\/]+)/i);
+	const dateMatch = text.match(/(?:date|dated)[:\s]*([0-9]{1,2}[\/\-.][0-9]{1,2}[\/\-.][0-9]{2,4}|[0-9]{4}-[0-9]{2}-[0-9]{2})/i)
+		|| text.match(/\b([0-9]{1,2}[\/\-.][0-9]{1,2}[\/\-.][0-9]{2,4})\b/);
+	const subtotalMatch = text.match(/sub\s*total[:\s]*([0-9]+(?:\.[0-9]{1,2})?)/i);
+	const discountMatch = text.match(/discount[:\s]*([0-9]+(?:\.[0-9]{1,2})?)/i);
+	const taxMatch = text.match(/(?:vat|tax)[:\s]*([0-9]+(?:\.[0-9]{1,2})?)/i);
+	const totalMatch = text.match(/(?:grand\s*)?total[:\s]*([0-9]+(?:\.[0-9]{1,2})?)/i);
+
+	return {
+		supplierName,
+		invoiceNumber: invoiceMatch ? invoiceMatch[1].trim() : null,
+		purchaseDate: dateMatch ? dateMatch[1].trim() : null,
+		subtotal: parseMoney(subtotalMatch?.[1]),
+		discount: parseMoney(discountMatch?.[1]),
+		tax: parseMoney(taxMatch?.[1]),
+		total: parseMoney(totalMatch?.[1]),
+	};
+};
+
+const normalizeDosageForm = (raw) => {
+	if (!raw) return null;
+	const key = String(raw).toLowerCase().trim();
+	return DOSAGE_FORM_MAP[key] || null;
+};
+
+/**
+ * Parse OCR text into line items only. Does NOT match against the medicine catalog.
+ * Unknown fields remain null/empty — never fabricated.
+ */
 const parseReceiptText = (rawText) => {
 	const lines = String(rawText || '')
 		.split(/\r?\n/)
@@ -78,8 +157,12 @@ const parseReceiptText = (rawText) => {
 		if (/^[\d\s.,:\-\/]+$/.test(line)) continue;
 
 		const strengthMatch = line.match(STRENGTH_RE);
-		const batchMatch = line.match(BATCH_RE) || lines[index + 1]?.match(BATCH_RE);
+		const formMatch = line.match(DOSAGE_FORM_RE) || lines[index + 1]?.match(DOSAGE_FORM_RE);
+		const batchMatch = line.match(BATCH_RE) || lines[index + 1]?.match(BATCH_RE) || lines[index + 2]?.match(BATCH_RE);
 		const expiryMatch = line.match(EXPIRY_RE) || lines[index + 1]?.match(EXPIRY_RE) || lines[index + 2]?.match(EXPIRY_RE);
+		const manufacturerMatch = line.match(MANUFACTURER_RE)
+			|| lines[index + 1]?.match(MANUFACTURER_RE)
+			|| lines[index + 2]?.match(MANUFACTURER_RE);
 
 		let quantity = null;
 		const qtyMatch = line.match(QTY_LABEL_RE) || line.match(QTY_UNIT_RE)
@@ -90,7 +173,7 @@ const parseReceiptText = (rawText) => {
 		}
 
 		let unitPrice = null;
-		const priceMatch = line.match(PRICE_RE);
+		const priceMatch = line.match(PRICE_RE) || lines[index + 1]?.match(PRICE_RE);
 		if (priceMatch) {
 			const parsedPrice = Number(priceMatch[1]);
 			if (Number.isFinite(parsedPrice) && parsedPrice >= 0) unitPrice = parsedPrice;
@@ -100,14 +183,28 @@ const parseReceiptText = (rawText) => {
 			.replace(BATCH_RE, '')
 			.replace(EXPIRY_RE, '')
 			.replace(PRICE_RE, '')
+			.replace(MANUFACTURER_RE, '')
 			.replace(/\bqty[:\s]*\d+\b/ig, '')
 			.replace(/\s{2,}/g, ' ')
 			.trim();
 
 		if (medicineName.length < 3) continue;
 		if (/^\d+$/.test(medicineName)) continue;
-		// Skip lines that look like addresses or pure metadata
 		if (medicineName.split(' ').length > 14) continue;
+		// Skip pure metadata lines that are not product rows.
+		if (/^(manufacturer|mfr\.?|company|batch|exp)\b/i.test(medicineName)) continue;
+
+		const dosageForm = normalizeDosageForm(formMatch?.[1]);
+		// Require a medicine signal so supplier/header lines are not treated as items.
+		const hasMedicineSignal = Boolean(
+			strengthMatch || dosageForm || quantity != null || unitPrice != null || batchMatch || expiryMatch,
+		);
+		if (!hasMedicineSignal) continue;
+
+		const brandName = medicineName.split(STRENGTH_RE)[0].trim() || medicineName;
+		const totalPrice = quantity != null && unitPrice != null
+			? Number((quantity * unitPrice).toFixed(2))
+			: null;
 
 		const confidence = Math.min(
 			0.95,
@@ -119,22 +216,24 @@ const parseReceiptText = (rawText) => {
 		);
 
 		items.push({
+			productName: medicineName,
 			medicine_name: medicineName,
-			brand_name: medicineName.split(STRENGTH_RE)[0].trim() || medicineName,
+			brand_name: brandName,
 			generic_name: null,
+			type: dosageForm,
+			dosage_form: dosageForm,
 			strength: strengthMatch ? strengthMatch[1].trim() : null,
-			dosage_form: null,
+			manufacturer: manufacturerMatch ? manufacturerMatch[1].trim() : null,
 			pack_size: null,
 			quantity,
 			unit_price: unitPrice,
-			total_price: null,
+			total_price: totalPrice,
 			batch_number: batchMatch ? batchMatch[1].trim() : null,
 			expiry_date: expiryMatch ? expiryMatch[1].trim() : null,
 			confidence,
 		});
 	}
 
-	// Deduplicate near-identical consecutive names
 	const deduped = [];
 	for (const item of items) {
 		const previous = deduped[deduped.length - 1];
@@ -143,6 +242,12 @@ const parseReceiptText = (rawText) => {
 			if (item.batch_number && !previous.batch_number) previous.batch_number = item.batch_number;
 			if (item.expiry_date && !previous.expiry_date) previous.expiry_date = item.expiry_date;
 			if (item.unit_price != null && previous.unit_price == null) previous.unit_price = item.unit_price;
+			if (item.total_price != null && previous.total_price == null) previous.total_price = item.total_price;
+			if (item.manufacturer && !previous.manufacturer) previous.manufacturer = item.manufacturer;
+			if (item.dosage_form && !previous.dosage_form) {
+				previous.dosage_form = item.dosage_form;
+				previous.type = item.dosage_form;
+			}
 			continue;
 		}
 		deduped.push(item);
@@ -151,7 +256,13 @@ const parseReceiptText = (rawText) => {
 	return deduped.slice(0, 100);
 };
 
-const extractReceiptItemsWithTesseract = async (file) => {
+/**
+ * OCR/AI extraction only.
+ * Does NOT load the medicine catalog.
+ * Does NOT match medicines.
+ * Does NOT modify stock.
+ */
+const extractReceiptWithTesseract = async (file) => {
 	const overallStartedAt = Date.now();
 	const fileBuffer = Buffer.isBuffer(file.buffer) ? file.buffer : Buffer.from(file.buffer);
 	const mimeType = file.mimetype || 'unknown';
@@ -173,11 +284,11 @@ const extractReceiptItemsWithTesseract = async (file) => {
 			text = await withTimeout(
 				extractPdfText(fileBuffer),
 				PDF_PARSE_TIMEOUT_MS,
-				'Receipt processing timed out. Please retry.',
+				'Receipt processing took too long. Please try again.',
 			);
 			logOcrStep('pdf_parse_done', pdfStartedAt, { textLength: text.trim().length });
 			if (!text || text.trim().length < 12) {
-				const error = new Error('Scanned/image-only PDF is not currently supported. Please upload the receipt as JPG or PNG.');
+				const error = new Error('Scanned PDF OCR is not currently supported. Please upload the receipt as JPG or PNG.');
 				error.statusCode = 422;
 				throw error;
 			}
@@ -207,24 +318,33 @@ const extractReceiptItemsWithTesseract = async (file) => {
 	}
 
 	const parseStartedAt = Date.now();
+	const header = parseReceiptHeader(text);
 	const items = parseReceiptText(text);
 	logOcrStep('text_parse_done', parseStartedAt, { itemCount: items.length });
 	if (items.length === 0) {
 		const error = new Error(
 			isPdf
-				? 'Scanned/image-only PDF is not currently supported. Please upload the receipt as JPG or PNG.'
+				? 'Scanned PDF OCR is not currently supported. Please upload the receipt as JPG or PNG.'
 				: 'Could not read this receipt. Please upload a clearer JPG or PNG.',
 		);
 		error.statusCode = 422;
 		throw error;
 	}
 	logOcrStep('complete', overallStartedAt, { itemCount: items.length, mimeType });
-	return items;
+	return { ...header, items };
+};
+
+/** @deprecated Prefer extractReceiptWithTesseract — kept for callers that expect an items array. */
+const extractReceiptItemsWithTesseract = async (file) => {
+	const result = await extractReceiptWithTesseract(file);
+	return result.items;
 };
 
 module.exports = {
+	extractReceiptWithTesseract,
 	extractReceiptItemsWithTesseract,
 	parseReceiptText,
+	parseReceiptHeader,
 	OCR_IMAGE_TIMEOUT_MS,
 	PDF_PARSE_TIMEOUT_MS,
 };

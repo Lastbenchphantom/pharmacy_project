@@ -22,13 +22,40 @@ if (process.env.NODE_ENV !== 'production') {
 let stockSchemaPromise = null;
 let medicineSearchIndexesPromise = null;
 
+const DOSAGE_FORMS = Object.freeze([
+	'Tablet', 'Capsule', 'Syrup', 'Suspension', 'Injection', 'Saline',
+	'Cream', 'Ointment', 'Drops', 'Inhaler', 'Powder', 'Sachet', 'Other',
+]);
+
+const normalizeDosageForm = (value) => {
+	if (typeof value !== 'string') return null;
+	const trimmed = value.trim();
+	if (!trimmed) return null;
+	const found = DOSAGE_FORMS.find((form) => form.toLowerCase() === trimmed.toLowerCase());
+	return found || null;
+};
+
 const ensureMedicineSearchIndexes = async () => {
 	if (!medicineSearchIndexesPromise) {
 		medicineSearchIndexesPromise = (async () => {
+			// Skip index DDL when the redesign indexes already exist (avoids multi-second remote round-trips).
+			const existing = await prisma.$queryRawUnsafe(`
+				SELECT indexname FROM pg_indexes
+				WHERE tablename = 'Medicine' AND indexname IN (
+					'Medicine_isActive_idx', 'Medicine_brandName_trgm_idx', 'Medicine_dosageForm_idx'
+				)
+			`).catch(() => []);
+			const names = new Set((existing || []).map((row) => row.indexname));
+			if (names.has('Medicine_isActive_idx') && names.has('Medicine_brandName_trgm_idx') && names.has('Medicine_dosageForm_idx')) {
+				return;
+			}
+
 			await prisma.$executeRawUnsafe(`CREATE EXTENSION IF NOT EXISTS pg_trgm`).catch(() => {});
 			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Medicine_availableQty_idx" ON "Medicine"("availableQty")`).catch(() => {});
 			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Medicine_strength_idx" ON "Medicine"("strength")`).catch(() => {});
 			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Medicine_manufacturer_idx" ON "Medicine"("manufacturer")`).catch(() => {});
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Medicine_dosageForm_idx" ON "Medicine"("dosageForm")`).catch(() => {});
+			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Medicine_isActive_idx" ON "Medicine"("isActive")`).catch(() => {});
 			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Medicine_brandName_trgm_idx" ON "Medicine" USING gin ("brandName" gin_trgm_ops)`).catch(() => {});
 			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Medicine_genericName_trgm_idx" ON "Medicine" USING gin ("genericName" gin_trgm_ops)`).catch(() => {});
 			await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Medicine_manufacturer_trgm_idx" ON "Medicine" USING gin ("manufacturer" gin_trgm_ops)`).catch(() => {});
@@ -40,6 +67,61 @@ const ensureMedicineSearchIndexes = async () => {
 	return medicineSearchIndexesPromise;
 };
 
+/** Additive inventory redesign columns (safe on every cold start). */
+let inventoryRedesignPromise = null;
+const ensureInventoryRedesignColumns = async () => {
+	if (inventoryRedesignPromise) return inventoryRedesignPromise;
+	inventoryRedesignPromise = (async () => {
+		// One information_schema round-trip instead of five LIMIT 0 probes (~3s saved on remote DB).
+		try {
+			const cols = await prisma.$queryRawUnsafe(`
+				SELECT table_name, column_name
+				FROM information_schema.columns
+				WHERE table_schema = 'public'
+					AND (
+						(table_name = 'Medicine' AND column_name IN ('dosageForm', 'isActive', 'description'))
+						OR (table_name = 'StockBatch' AND column_name IN ('purchasePrice', 'sellingPrice'))
+						OR (table_name = 'StockReceipt' AND column_name IN ('supplierName', 'total'))
+						OR (table_name = 'StockReceiptItem' AND column_name = 'manufacturer')
+						OR (table_name = 'StockTransaction' AND column_name = 'batchId')
+					)
+			`);
+			const key = (table, column) => `${table}.${column}`;
+			const present = new Set((cols || []).map((row) => key(row.table_name, row.column_name)));
+			const required = [
+				'Medicine.dosageForm', 'Medicine.isActive', 'Medicine.description',
+				'StockBatch.purchasePrice', 'StockBatch.sellingPrice',
+				'StockReceipt.supplierName', 'StockReceipt.total',
+				'StockReceiptItem.manufacturer',
+				'StockTransaction.batchId',
+			];
+			if (required.every((name) => present.has(name))) return;
+		} catch {
+			// Fall through to additive DDL.
+		}
+
+		await prisma.$executeRawUnsafe(`ALTER TABLE "Medicine" ADD COLUMN IF NOT EXISTS "dosageForm" TEXT NOT NULL DEFAULT 'Other'`).catch(() => {});
+		await prisma.$executeRawUnsafe(`ALTER TABLE "Medicine" ADD COLUMN IF NOT EXISTS "description" TEXT`).catch(() => {});
+		await prisma.$executeRawUnsafe(`ALTER TABLE "Medicine" ADD COLUMN IF NOT EXISTS "isActive" BOOLEAN NOT NULL DEFAULT true`).catch(() => {});
+		await prisma.$executeRawUnsafe(`ALTER TABLE "StockBatch" ADD COLUMN IF NOT EXISTS "purchasePrice" DOUBLE PRECISION`).catch(() => {});
+		await prisma.$executeRawUnsafe(`ALTER TABLE "StockBatch" ADD COLUMN IF NOT EXISTS "sellingPrice" DOUBLE PRECISION`).catch(() => {});
+		await prisma.$executeRawUnsafe(`ALTER TABLE "StockReceipt" ADD COLUMN IF NOT EXISTS "supplierName" TEXT`).catch(() => {});
+		await prisma.$executeRawUnsafe(`ALTER TABLE "StockReceipt" ADD COLUMN IF NOT EXISTS "invoiceNumber" TEXT`).catch(() => {});
+		await prisma.$executeRawUnsafe(`ALTER TABLE "StockReceipt" ADD COLUMN IF NOT EXISTS "purchaseDate" TEXT`).catch(() => {});
+		await prisma.$executeRawUnsafe(`ALTER TABLE "StockReceipt" ADD COLUMN IF NOT EXISTS "subtotal" DOUBLE PRECISION`).catch(() => {});
+		await prisma.$executeRawUnsafe(`ALTER TABLE "StockReceipt" ADD COLUMN IF NOT EXISTS "discount" DOUBLE PRECISION`).catch(() => {});
+		await prisma.$executeRawUnsafe(`ALTER TABLE "StockReceipt" ADD COLUMN IF NOT EXISTS "tax" DOUBLE PRECISION`).catch(() => {});
+		await prisma.$executeRawUnsafe(`ALTER TABLE "StockReceipt" ADD COLUMN IF NOT EXISTS "total" DOUBLE PRECISION`).catch(() => {});
+		await prisma.$executeRawUnsafe(`ALTER TABLE "StockReceiptItem" ADD COLUMN IF NOT EXISTS "manufacturer" TEXT`).catch(() => {});
+		await prisma.$executeRawUnsafe(`ALTER TABLE "StockTransaction" ADD COLUMN IF NOT EXISTS "batchId" TEXT`).catch(() => {});
+		await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "StockTransaction_batchId_idx" ON "StockTransaction"("batchId")`).catch(() => {});
+	})().catch((error) => {
+		inventoryRedesignPromise = null;
+		throw error;
+	});
+	return inventoryRedesignPromise;
+};
+
 const ensureStockSchema = async () => {
 	if (!stockSchemaPromise) {
 		stockSchemaPromise = (async () => {
@@ -48,6 +130,7 @@ const ensureStockSchema = async () => {
 				await prisma.$queryRaw`SELECT 1 FROM "StockReceipt" LIMIT 1`;
 				await prisma.$queryRaw`SELECT 1 FROM "StockBatch" LIMIT 1`;
 				await prisma.$queryRaw`SELECT 1 FROM "StockTransaction" LIMIT 1`;
+				await ensureInventoryRedesignColumns();
 				await ensureMedicineSearchIndexes();
 				return;
 			} catch {
@@ -169,6 +252,7 @@ const ensureStockSchema = async () => {
 			for (const statement of fkStatements) {
 				await prisma.$executeRawUnsafe(statement).catch(() => {});
 			}
+			await ensureInventoryRedesignColumns();
 			await ensureMedicineSearchIndexes();
 		})().catch((error) => {
 			stockSchemaPromise = null;
@@ -272,22 +356,37 @@ const parseLimitOffset = (query, defaultLimit = 50, maxLimit = 100) => {
 };
 
 const MEDICINE_LIST_SELECT = Prisma.sql`
-	"id", "brandName", "genericName", "manufacturer", "strength", "availableQty",
-	"piece_price", "box_price", "createdAt", "updatedAt"
+	"id", "brandName", "genericName", "manufacturer", "strength", "dosageForm", "description",
+	"availableQty", "piece_price", "box_price", "isActive", "createdAt", "updatedAt"
 `;
 
-const mapMedicineRow = (medicine) => ({
-	id: medicine.id,
-	brandName: medicine.brandName,
-	genericName: medicine.genericName,
-	manufacturer: medicine.manufacturer,
-	strength: medicine.strength,
-	availableQty: Number(medicine.availableQty || 0),
-	singlePiecePrice: Number(medicine.piece_price ?? medicine.singlePiecePrice ?? 0),
-	fullBoxPrice: Number(medicine.box_price ?? medicine.fullBoxPrice ?? 0),
-	createdAt: medicine.createdAt,
-	updatedAt: medicine.updatedAt,
-});
+const mapMedicineRow = (medicine, { includePurchaseCost = false } = {}) => {
+	const dosageForm = medicine.dosageForm || 'Other';
+	const mapped = {
+		id: medicine.id,
+		brandName: medicine.brandName,
+		name: medicine.brandName,
+		genericName: medicine.genericName,
+		manufacturer: medicine.manufacturer,
+		strength: medicine.strength,
+		dosageForm,
+		type: dosageForm,
+		category: dosageForm,
+		description: medicine.description || null,
+		availableQty: Number(medicine.availableQty || 0),
+		sellingPrice: Number(medicine.piece_price ?? medicine.singlePiecePrice ?? 0),
+		singlePiecePrice: Number(medicine.piece_price ?? medicine.singlePiecePrice ?? 0),
+		fullBoxPrice: Number(medicine.box_price ?? medicine.fullBoxPrice ?? 0),
+		isActive: medicine.isActive !== false,
+		status: medicine.isActive === false ? 'inactive' : (Number(medicine.availableQty || 0) > 0 ? 'in_stock' : 'out_of_stock'),
+		createdAt: medicine.createdAt,
+		updatedAt: medicine.updatedAt,
+	};
+	if (includePurchaseCost) {
+		mapped.purchasePrice = Number(medicine.purchasePrice ?? 0);
+	}
+	return mapped;
+};
 
 const escapeIlikePattern = (value) => String(value || '').replace(/[\\%_]/g, '\\$&');
 
@@ -519,8 +618,13 @@ const findStockBatch = async (tx, medicineId, batchNumber, expiryDate) => {
 };
 
 const recomputeMedicineQty = async (tx, medicineId) => {
+	// Sellable stock excludes expired batches.
 	const rows = await tx.$queryRaw(Prisma.sql`
-		SELECT COALESCE(SUM("quantity"), 0)::int AS "total" FROM "StockBatch" WHERE "medicineId" = ${medicineId}
+		SELECT COALESCE(SUM("quantity"), 0)::int AS "total"
+		FROM "StockBatch"
+		WHERE "medicineId" = ${medicineId}
+			AND "quantity" > 0
+			AND ("expiryDate" IS NULL OR "expiryDate"::date >= CURRENT_DATE)
 	`);
 	const total = Number(rows[0]?.total || 0);
 	await tx.$executeRaw(Prisma.sql`
@@ -546,27 +650,46 @@ const seedLegacyStockBatchIfNeeded = async (tx, medicineId) => {
 	}
 };
 
-const addToStockBatch = async (tx, { medicineId, batchNumber, expiryDate, quantityDelta }) => {
+const addToStockBatch = async (tx, {
+	medicineId,
+	batchNumber,
+	expiryDate,
+	quantityDelta,
+	purchasePrice = null,
+	sellingPrice = null,
+}) => {
 	const existing = await findStockBatch(tx, medicineId, batchNumber, expiryDate);
 	if (existing) {
 		const nextQty = Number(existing.quantity) + quantityDelta;
 		if (nextQty < 0) throw Object.assign(new Error('Batch quantity cannot go below zero'), { statusCode: 400 });
+		const nextPurchase = purchasePrice != null && Number.isFinite(Number(purchasePrice)) ? Number(purchasePrice) : existing.purchasePrice;
+		const nextSelling = sellingPrice != null && Number.isFinite(Number(sellingPrice)) ? Number(sellingPrice) : existing.sellingPrice;
 		await tx.$executeRaw(Prisma.sql`
 			UPDATE "StockBatch"
 			SET "quantity" = ${nextQty},
 				"expiryDate" = ${expiryDate || existing.expiryDate},
+				"purchasePrice" = ${nextPurchase},
+				"sellingPrice" = ${nextSelling},
 				"updatedAt" = NOW()
 			WHERE "id" = ${existing.id}
 		`);
-		return { ...existing, quantity: nextQty, expiryDate: expiryDate || existing.expiryDate };
+		return {
+			...existing,
+			quantity: nextQty,
+			expiryDate: expiryDate || existing.expiryDate,
+			purchasePrice: nextPurchase,
+			sellingPrice: nextSelling,
+		};
 	}
 	if (quantityDelta < 0) throw Object.assign(new Error('No matching batch to reduce'), { statusCode: 400 });
 	const id = crypto.randomUUID();
+	const purchase = purchasePrice != null && Number.isFinite(Number(purchasePrice)) ? Number(purchasePrice) : null;
+	const selling = sellingPrice != null && Number.isFinite(Number(sellingPrice)) ? Number(sellingPrice) : null;
 	await tx.$executeRaw(Prisma.sql`
-		INSERT INTO "StockBatch" ("id", "medicineId", "batchNumber", "expiryDate", "quantity", "createdAt", "updatedAt")
-		VALUES (${id}, ${medicineId}, ${batchNumber}, ${expiryDate}, ${quantityDelta}, NOW(), NOW())
+		INSERT INTO "StockBatch" ("id", "medicineId", "batchNumber", "expiryDate", "quantity", "purchasePrice", "sellingPrice", "createdAt", "updatedAt")
+		VALUES (${id}, ${medicineId}, ${batchNumber}, ${expiryDate}, ${quantityDelta}, ${purchase}, ${selling}, NOW(), NOW())
 	`);
-	return { id, medicineId, batchNumber, expiryDate, quantity: quantityDelta };
+	return { id, medicineId, batchNumber, expiryDate, quantity: quantityDelta, purchasePrice: purchase, sellingPrice: selling };
 };
 
 const reduceStockAcrossBatches = async (tx, medicineId, amount) => {
@@ -574,6 +697,7 @@ const reduceStockAcrossBatches = async (tx, medicineId, amount) => {
 	const batches = await tx.$queryRaw(Prisma.sql`
 		SELECT * FROM "StockBatch"
 		WHERE "medicineId" = ${medicineId} AND "quantity" > 0
+			AND ("expiryDate" IS NULL OR "expiryDate"::date >= CURRENT_DATE)
 		ORDER BY CASE WHEN "expiryDate" IS NULL THEN 1 ELSE 0 END, "expiryDate" ASC, "createdAt" ASC
 		FOR UPDATE
 	`);
@@ -585,12 +709,13 @@ const reduceStockAcrossBatches = async (tx, medicineId, amount) => {
 		`);
 		remaining -= take;
 	}
-	if (remaining > 0) throw Object.assign(new Error('Not enough batch quantity to reduce stock'), { statusCode: 400 });
+	if (remaining > 0) throw Object.assign(new Error('Not enough sellable (non-expired) batch quantity to reduce stock'), { statusCode: 400 });
 };
 
 const writeStockTransaction = async (tx, {
 	receiptId = null,
 	medicineId,
+	batchId = null,
 	transactionType,
 	quantity,
 	previousStock,
@@ -603,10 +728,10 @@ const writeStockTransaction = async (tx, {
 	const expiryStored = expiryDate instanceof Date ? expiryDateToStorageString(expiryDate) : (expiryDate || null);
 	await tx.$executeRaw(Prisma.sql`
 		INSERT INTO "StockTransaction" (
-			"id", "receiptId", "medicineId", "transactionType", "quantity", "previousStock", "newStock",
+			"id", "receiptId", "medicineId", "batchId", "transactionType", "quantity", "previousStock", "newStock",
 			"batchNumber", "expiryDate", "reason", "createdBy", "createdAt"
 		) VALUES (
-			${crypto.randomUUID()}, ${receiptId}, ${medicineId}, ${transactionType}, ${quantity},
+			${crypto.randomUUID()}, ${receiptId}, ${medicineId}, ${batchId}, ${transactionType}, ${quantity},
 			${previousStock}, ${newStock}, ${batchNumber}, ${expiryStored}, ${reason}, ${createdBy}, NOW()
 		)
 	`);
@@ -656,73 +781,63 @@ const textSimilarity = (left, right) => {
 	return 1 - (levenshtein(normalizedLeft, normalizedRight) / Math.max(normalizedLeft.length, normalizedRight.length));
 };
 
-const matchReceiptMedicine = (item, medicines) => {
-	const receiptText = [item.medicine_name, item.brand_name, item.generic_name, item.strength, item.dosage_form].filter(Boolean).join(' ');
-	const ranked = medicines.map((medicine) => {
-		const nameScore = Math.max(textSimilarity(item.medicine_name, medicine.brandName), textSimilarity(item.brand_name, medicine.brandName));
-		const genericScore = textSimilarity(item.generic_name, medicine.genericName);
-		const strengthScore = item.strength ? textSimilarity(item.strength, medicine.strength) : 0.5;
-		const fullScore = textSimilarity(receiptText, [medicine.brandName, medicine.genericName, medicine.strength].join(' '));
-		return { medicine, score: (nameScore * 0.5) + (genericScore * 0.2) + (strengthScore * 0.15) + (fullScore * 0.15) };
-	}).sort((left, right) => right.score - left.score);
-	const best = ranked[0];
-	const second = ranked[1];
-	if (!best || best.score < 0.62 || (second && best.score - second.score < 0.06 && best.score < 0.86)) {
-		return { matchStatus: 'NEEDS_MANUAL', matchedMedicineId: null, matchScore: best?.score || 0 };
-	}
-	return { matchStatus: 'MATCHED', matchedMedicineId: best.medicine.id, matchScore: best.score };
-};
+/**
+ * Soft duplicate check for admin create. Never auto-merges.
+ * Scores brand + optional generic/strength/manufacturer/dosageForm.
+ */
+const findSimilarMedicines = async ({
+	brandName,
+	genericName = '',
+	strength = '',
+	manufacturer = '',
+	dosageForm = '',
+	limit = 8,
+} = {}) => {
+	const brand = String(brandName || '').trim();
+	if (brand.length < 2) return [];
 
-/** Pull a small candidate set from Postgres instead of scoring against all ~21k medicines. */
-const findMedicineMatchCandidates = async (item, limit = 40) => {
-	const rawTokens = [item.brand_name, item.medicine_name, item.generic_name]
-		.filter(Boolean)
-		.flatMap((value) => normalizeMedicineText(value).split(' '))
-		.filter((token) => token.length >= 3 && !/^\d+$/.test(token));
-	const uniqueTokens = [...new Set(rawTokens)].slice(0, 4);
-	if (uniqueTokens.length === 0) {
-		const fallback = normalizeMedicineText(item.medicine_name || item.brand_name || '').slice(0, 24);
-		if (fallback.length < 2) return [];
-		uniqueTokens.push(fallback);
-	}
-
-	const conditions = uniqueTokens.map((token) => {
-		const pattern = `%${escapeIlikePattern(token)}%`;
-		return Prisma.sql`(
-			"brandName" ILIKE ${pattern} ESCAPE '\\'
-			OR "genericName" ILIKE ${pattern} ESCAPE '\\'
-			OR "manufacturer" ILIKE ${pattern} ESCAPE '\\'
-			OR "strength" ILIKE ${pattern} ESCAPE '\\'
-		)`;
-	});
-
-	const strength = typeof item.strength === 'string' ? item.strength.trim() : '';
-	if (strength) {
-		const strengthPattern = `%${escapeIlikePattern(strength)}%`;
-		conditions.push(Prisma.sql`"strength" ILIKE ${strengthPattern} ESCAPE '\\'`);
-	}
-
-	return prisma.$queryRaw(Prisma.sql`
-		SELECT "id", "brandName", "genericName", "strength", "availableQty"
-		FROM "Medicine"
-		WHERE ${Prisma.join(conditions, ' OR ')}
-		ORDER BY "brandName" ASC
-		LIMIT ${limit}
+	const brandPattern = `%${escapeIlikePattern(brand)}%`;
+	const candidates = await prisma.$queryRaw(Prisma.sql`
+		SELECT ${MEDICINE_LIST_SELECT} FROM "Medicine"
+		WHERE "brandName" ILIKE ${brandPattern} ESCAPE '\\'
+		ORDER BY
+			CASE WHEN lower("brandName") = lower(${brand}) THEN 0 ELSE 1 END,
+			"brandName" ASC
+		LIMIT 40
 	`);
+
+	const ranked = candidates.map((medicine) => {
+		const nameScore = textSimilarity(brand, medicine.brandName);
+		const genericScore = genericName
+			? textSimilarity(genericName, medicine.genericName)
+			: 0.5;
+		const strengthScore = strength
+			? textSimilarity(strength, medicine.strength)
+			: 0.5;
+		const manufacturerScore = manufacturer
+			? textSimilarity(manufacturer, medicine.manufacturer)
+			: 0.5;
+		const formScore = dosageForm && medicine.dosageForm
+			? (normalizeDosageForm(dosageForm) === normalizeDosageForm(medicine.dosageForm) ? 1 : 0.3)
+			: 0.5;
+		const score = (nameScore * 0.45)
+			+ (genericScore * 0.15)
+			+ (strengthScore * 0.15)
+			+ (manufacturerScore * 0.15)
+			+ (formScore * 0.1);
+		return { medicine, score };
+	})
+		.filter((row) => row.score >= 0.55)
+		.sort((left, right) => right.score - left.score)
+		.slice(0, limit);
+
+	return ranked.map((row) => row.medicine);
 };
 
-const matchReceiptItemAgainstDatabase = async (item) => {
-	const candidates = await findMedicineMatchCandidates(item, 40);
-	if (candidates.length === 0) {
-		return { matchStatus: 'NEEDS_MANUAL', matchedMedicineId: null, matchScore: 0 };
-	}
-	return matchReceiptMedicine(item, candidates);
-};
-
-const extractReceiptItems = async (file) => {
+const extractReceiptData = async (file) => {
 	// Lazy-load OCR so public medicine routes do not pull tesseract.js on cold start.
-	const { extractReceiptItemsWithTesseract } = require('../receiptOcr');
-	return extractReceiptItemsWithTesseract(file);
+	const { extractReceiptWithTesseract } = require('../receiptOcr');
+	return extractReceiptWithTesseract(file);
 };
 
 /** In-flight process locks for this serverless isolate (prevents duplicate simultaneous OCR). */
@@ -735,9 +850,11 @@ const MAX_RECEIPT_PROCESS_RETRIES = Number.parseInt(process.env.RECEIPT_MAX_PROC
 
 const sanitizeReceiptErrorMessage = (message) => {
 	const text = String(message || 'Receipt processing failed. Please try again.').replace(/\s+/g, ' ').trim();
-	if (/timeout|RECEIPT_OCR_TIMEOUT|504/i.test(text)) return 'Receipt processing timed out. Please retry.';
-	if (/scanned\/image-only pdf|little readable text/i.test(text)) {
-		return 'Scanned/image-only PDF is not currently supported. Please upload the receipt as JPG or PNG.';
+	if (/timeout|RECEIPT_OCR_TIMEOUT|504|took too long/i.test(text)) {
+		return 'Receipt processing took too long. Please try again.';
+	}
+	if (/scanned\/image-only pdf|scanned pdf ocr|little readable text/i.test(text)) {
+		return 'Scanned PDF OCR is not currently supported. Please upload the receipt as JPG or PNG.';
 	}
 	if (/could not read|empty|corrupt|invalid pdf|unreadable|clearer/i.test(text)) {
 		return 'Could not read this receipt. Please upload a clearer JPG or PNG.';
@@ -763,10 +880,17 @@ const markReceiptFailed = async (receiptId, message) => {
 };
 
 const getReceiptDetails = async (receiptId) => {
-	const receipts = await prisma.$queryRaw(Prisma.sql`SELECT "id", "fileName", "mimeType", "status", "uploadedBy", "uploadedAt", "processedAt", "confirmedBy", "confirmedAt", "errorMessage" FROM "StockReceipt" WHERE "id" = ${receiptId}`);
+	const receipts = await prisma.$queryRaw(Prisma.sql`
+		SELECT "id", "fileName", "mimeType", "status", "uploadedBy", "uploadedAt", "processedAt",
+			"confirmedBy", "confirmedAt", "errorMessage",
+			"supplierName", "invoiceNumber", "purchaseDate", "subtotal", "discount", "tax", "total"
+		FROM "StockReceipt" WHERE "id" = ${receiptId}
+	`);
 	if (receipts.length === 0) return null;
 	const items = await prisma.$queryRaw(Prisma.sql`
-		SELECT i.*, m."brandName" AS "matchedBrandName", m."genericName" AS "matchedGenericName", m."strength" AS "matchedStrength", m."availableQty" AS "currentStock"
+		SELECT i.*, m."brandName" AS "matchedBrandName", m."genericName" AS "matchedGenericName",
+			m."strength" AS "matchedStrength", m."dosageForm" AS "matchedDosageForm",
+			m."availableQty" AS "currentStock"
 		FROM "StockReceiptItem" i LEFT JOIN "Medicine" m ON m."id" = i."matchedMedicineId"
 		WHERE i."receiptId" = ${receiptId} ORDER BY i."id"
 	`);
@@ -790,19 +914,34 @@ app.post('/api/admin/login', rateLimit('admin-login', 5, 60_000), (req, res) => 
 
 app.get('/api/medicines', async (req, res, next) => {
 	try {
+		await ensureStockSchema().catch(() => {});
 		const { limit, offset, page } = parseLimitOffset(req.query, 25, 100);
 		const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
 		const searchPattern = search ? `%${escapeIlikePattern(search)}%` : null;
 		const wantFeatured = req.query.random === 'true' && !searchPattern;
+		const dosageFormFilter = normalizeDosageForm(req.query.dosageForm || req.query.type || req.query.category);
+		const includeInactive = req.query.includeInactive === 'true';
+		const stockStatus = typeof req.query.stockStatus === 'string' ? req.query.stockStatus.trim().toLowerCase() : '';
+		const activeFilter = includeInactive ? Prisma.empty : Prisma.sql`AND "isActive" = true`;
+		const typeFilter = dosageFormFilter
+			? Prisma.sql`AND "dosageForm" = ${dosageFormFilter}`
+			: Prisma.empty;
+		const stockFilter = stockStatus === 'out_of_stock'
+			? Prisma.sql`AND "availableQty" <= 0`
+			: stockStatus === 'low_stock'
+				? Prisma.sql`AND "availableQty" > 0 AND "availableQty" <= ${resolvedLowStockThreshold}`
+				: stockStatus === 'in_stock'
+					? Prisma.sql`AND "availableQty" > 0`
+					: Prisma.empty;
 
 		let medicines;
 		let total;
 
 		if (wantFeatured) {
-			// Avoid ORDER BY RANDOM() full-table sort on 21k rows.
+			// Avoid ORDER BY RANDOM() full-table sort on large catalogs.
 			medicines = await prisma.$queryRaw(Prisma.sql`
 				SELECT ${MEDICINE_LIST_SELECT} FROM "Medicine"
-				WHERE "availableQty" > 0
+				WHERE "availableQty" > 0 AND "isActive" = true ${typeFilter}
 				ORDER BY "updatedAt" DESC
 				LIMIT ${limit}
 			`);
@@ -810,6 +949,7 @@ app.get('/api/medicines', async (req, res, next) => {
 				const remaining = limit - medicines.length;
 				const extras = await prisma.$queryRaw(Prisma.sql`
 					SELECT ${MEDICINE_LIST_SELECT} FROM "Medicine"
+					WHERE "isActive" = true ${typeFilter}
 					ORDER BY "brandName" ASC
 					LIMIT ${remaining}
 				`);
@@ -821,10 +961,13 @@ app.get('/api/medicines', async (req, res, next) => {
 			total = medicines.length;
 		} else if (searchPattern) {
 			const whereSql = Prisma.sql`
-				"brandName" ILIKE ${searchPattern} ESCAPE '\\'
+				("brandName" ILIKE ${searchPattern} ESCAPE '\\'
 				OR "genericName" ILIKE ${searchPattern} ESCAPE '\\'
 				OR "manufacturer" ILIKE ${searchPattern} ESCAPE '\\'
-				OR "strength" ILIKE ${searchPattern} ESCAPE '\\'
+				OR "strength" ILIKE ${searchPattern} ESCAPE '\\')
+				${activeFilter}
+				${typeFilter}
+				${stockFilter}
 			`;
 			const [countRow] = await prisma.$queryRaw(Prisma.sql`
 				SELECT COUNT(*)::int AS "count" FROM "Medicine" WHERE ${whereSql}
@@ -844,16 +987,19 @@ app.get('/api/medicines', async (req, res, next) => {
 				LIMIT ${limit} OFFSET ${offset}
 			`);
 		} else {
-			const [countRow] = await prisma.$queryRaw(Prisma.sql`SELECT COUNT(*)::int AS "count" FROM "Medicine"`);
+			const [countRow] = await prisma.$queryRaw(Prisma.sql`
+				SELECT COUNT(*)::int AS "count" FROM "Medicine" WHERE TRUE ${activeFilter} ${typeFilter} ${stockFilter}
+			`);
 			total = Number(countRow?.count || 0);
 			medicines = await prisma.$queryRaw(Prisma.sql`
 				SELECT ${MEDICINE_LIST_SELECT} FROM "Medicine"
+				WHERE TRUE ${activeFilter} ${typeFilter} ${stockFilter}
 				ORDER BY "brandName" ASC, "genericName" ASC
 				LIMIT ${limit} OFFSET ${offset}
 			`);
 		}
 
-		const items = medicines.map(mapMedicineRow);
+		const items = medicines.map((row) => mapMedicineRow(row));
 		const totalPages = Math.max(1, Math.ceil(total / limit));
 		res.json(serializeDatabaseValue({
 			items,
@@ -976,41 +1122,57 @@ const runReceiptProcessing = async (receiptId, { allowReadyPassthrough = true } 
 		}
 
 		const ocrStartedAt = Date.now();
-		const extractedItems = await extractReceiptItems({
+		const extracted = await extractReceiptData({
 			buffer: fileBuffer,
 			mimetype: receipt.mimeType,
 			originalname: receipt.fileName,
 		});
+		const extractedItems = Array.isArray(extracted?.items) ? extracted.items : [];
 		logReceiptProcessStep(isPdf ? 'pdf_parsing' : 'image_ocr_ai', ocrStartedAt, {
 			receiptId,
 			itemCount: extractedItems.length,
 		});
 
-		const matchStartedAt = Date.now();
-		const matchedItems = [];
-		for (const extractedItem of extractedItems) {
-			const match = await matchReceiptItemAgainstDatabase(extractedItem);
-			matchedItems.push({ extractedItem, match });
-		}
-		logReceiptProcessStep('medicine_candidate_matching', matchStartedAt, {
-			receiptId,
-			itemCount: matchedItems.length,
-		});
-
+		// OCR is extract-only: never match against the medicine catalog or modify stock.
 		const dbUpdateStartedAt = Date.now();
 		await prisma.$transaction(async (tx) => {
 			await tx.$executeRaw(Prisma.sql`DELETE FROM "StockReceiptItem" WHERE "receiptId" = ${receiptId}`);
-			for (const { extractedItem, match } of matchedItems) {
+			for (const extractedItem of extractedItems) {
 				const quantity = Number.isInteger(extractedItem.quantity) && extractedItem.quantity >= 0 ? extractedItem.quantity : null;
 				const confidence = Number.isFinite(Number(extractedItem.confidence)) ? Math.min(Math.max(Number(extractedItem.confidence), 0), 1) : 0;
+				const productName = String(
+					extractedItem.productName || extractedItem.medicine_name || 'Unidentified item',
+				).trim();
+				const dosageForm = normalizeDosageForm(extractedItem.type || extractedItem.dosage_form);
 				await tx.$executeRaw(Prisma.sql`
-					INSERT INTO "StockReceiptItem" ("id", "receiptId", "medicineName", "brandName", "genericName", "strength", "dosageForm", "packSize", "quantity", "unitPrice", "totalPrice", "batchNumber", "expiryDate", "confidence", "matchStatus", "matchedMedicineId")
-					VALUES (${crypto.randomUUID()}, ${receiptId}, ${String(extractedItem.medicine_name || 'Unidentified item').trim()}, ${extractedItem.brand_name || null}, ${extractedItem.generic_name || null}, ${extractedItem.strength || null}, ${extractedItem.dosage_form || null}, ${extractedItem.pack_size || null}, ${quantity}, ${Number.isFinite(Number(extractedItem.unit_price)) ? Number(extractedItem.unit_price) : null}, ${Number.isFinite(Number(extractedItem.total_price)) ? Number(extractedItem.total_price) : null}, ${extractedItem.batch_number || null}, ${extractedItem.expiry_date || null}, ${confidence}, ${match.matchStatus}, ${match.matchedMedicineId})
+					INSERT INTO "StockReceiptItem" (
+						"id", "receiptId", "medicineName", "brandName", "genericName", "strength", "dosageForm",
+						"manufacturer", "packSize", "quantity", "unitPrice", "totalPrice", "batchNumber", "expiryDate",
+						"confidence", "matchStatus", "matchedMedicineId"
+					) VALUES (
+						${crypto.randomUUID()}, ${receiptId}, ${productName},
+						${extractedItem.brand_name || null}, ${extractedItem.generic_name || null},
+						${extractedItem.strength || null}, ${dosageForm}, ${extractedItem.manufacturer || null},
+						${extractedItem.pack_size || null}, ${quantity},
+						${Number.isFinite(Number(extractedItem.unit_price)) ? Number(extractedItem.unit_price) : null},
+						${Number.isFinite(Number(extractedItem.total_price)) ? Number(extractedItem.total_price) : null},
+						${extractedItem.batch_number || null}, ${extractedItem.expiry_date || null},
+						${confidence}, 'UNMATCHED', NULL
+					)
 				`);
 			}
 			await tx.$executeRaw(Prisma.sql`
 				UPDATE "StockReceipt"
-				SET "status" = 'READY_FOR_REVIEW', "processedAt" = NOW(), "errorMessage" = NULL
+				SET "status" = 'READY_FOR_REVIEW',
+					"processedAt" = NOW(),
+					"errorMessage" = NULL,
+					"supplierName" = ${extracted.supplierName || null},
+					"invoiceNumber" = ${extracted.invoiceNumber || null},
+					"purchaseDate" = ${extracted.purchaseDate || null},
+					"subtotal" = ${Number.isFinite(Number(extracted.subtotal)) ? Number(extracted.subtotal) : null},
+					"discount" = ${Number.isFinite(Number(extracted.discount)) ? Number(extracted.discount) : null},
+					"tax" = ${Number.isFinite(Number(extracted.tax)) ? Number(extracted.tax) : null},
+					"total" = ${Number.isFinite(Number(extracted.total)) ? Number(extracted.total) : null}
 				WHERE "id" = ${receiptId} AND "status" = 'PROCESSING'
 			`);
 		});
@@ -1102,14 +1264,26 @@ app.get('/api/stock/receipt/:id', requireAdmin, requireStockSchema, async (req, 
 app.post('/api/stock/receipt/confirm', requireAdmin, requireStockSchema, async (req, res, next) => {
 	const receiptId = typeof req.body?.receiptId === 'string' ? req.body.receiptId : '';
 	const reviewItems = Array.isArray(req.body?.items) ? req.body.items : null;
+	const receiptMeta = req.body?.receipt && typeof req.body.receipt === 'object' ? req.body.receipt : {};
 	if (!receiptId || !reviewItems) return res.status(400).json({ error: 'receiptId and review items are required' });
+	if (reviewItems.length === 0) return res.status(400).json({ error: 'At least one receipt item is required' });
 	if (reviewItems.length > 100) return res.status(400).json({ error: 'A receipt cannot contain more than 100 items' });
 	const itemIds = new Set();
 	for (const item of reviewItems) {
-		if (!item || typeof item.id !== 'string' || itemIds.has(item.id) || typeof item.medicineId !== 'string' || !Number.isInteger(item.quantity) || item.quantity <= 0 || item.quantity > 1000000) {
-			return res.status(400).json({ error: 'Each confirmed item needs a unique id, medicine, and positive quantity' });
+		if (!item || typeof item.id !== 'string' || itemIds.has(item.id)) {
+			return res.status(400).json({ error: 'Each confirmed item needs a unique id' });
 		}
 		itemIds.add(item.id);
+		const quantity = Number(item.quantity);
+		if (!Number.isInteger(quantity) || quantity <= 0 || quantity > 1000000) {
+			return res.status(400).json({ error: 'Each confirmed item needs a positive quantity' });
+		}
+		const createNew = item.createNew === true;
+		if (!createNew && (typeof item.medicineId !== 'string' || !item.medicineId)) {
+			return res.status(400).json({
+				error: 'Select an existing medicine or choose Create new medicine for each item',
+			});
+		}
 	}
 
 	try {
@@ -1122,31 +1296,71 @@ app.post('/api/stock/receipt/confirm', requireAdmin, requireStockSchema, async (
 			}
 			if (receipts[0].status !== 'READY_FOR_REVIEW') return { type: 'not-ready' };
 
-			const receiptItems = await tx.$queryRaw(Prisma.sql`SELECT "id", "medicineName", "quantity", "matchedMedicineId", "batchNumber", "expiryDate" FROM "StockReceiptItem" WHERE "receiptId" = ${receiptId} FOR UPDATE`);
+			const receiptItems = await tx.$queryRaw(Prisma.sql`
+				SELECT "id", "medicineName", "quantity", "matchedMedicineId", "batchNumber", "expiryDate",
+					"brandName", "genericName", "strength", "dosageForm", "manufacturer", "unitPrice", "totalPrice"
+				FROM "StockReceiptItem" WHERE "receiptId" = ${receiptId} FOR UPDATE
+			`);
 			const receiptItemMap = new Map(receiptItems.map((item) => [item.id, item]));
 
 			const missingExpiryRows = [];
+			const validationErrors = [];
 			const prepared = [];
 			for (const reviewItem of reviewItems) {
 				const receiptItem = receiptItemMap.get(reviewItem.id);
 				if (!receiptItem) throw Object.assign(new Error('Receipt item does not belong to this receipt'), { statusCode: 400 });
+
+				const productName = typeof reviewItem.medicineName === 'string' && reviewItem.medicineName.trim()
+					? reviewItem.medicineName.trim()
+					: (typeof reviewItem.productName === 'string' && reviewItem.productName.trim()
+						? reviewItem.productName.trim()
+						: receiptItem.medicineName);
+				const dosageForm = normalizeDosageForm(reviewItem.dosageForm || reviewItem.type || receiptItem.dosageForm);
+				const quantity = Number(reviewItem.quantity);
 				const expiryRaw = reviewItem.expiryDate ?? receiptItem.expiryDate;
 				const parsedExpiry = parseExpiryDate(expiryRaw);
+				const unitPriceRaw = reviewItem.unitPrice ?? receiptItem.unitPrice;
+				const unitPrice = unitPriceRaw === null || unitPriceRaw === undefined || unitPriceRaw === ''
+					? null
+					: Number(unitPriceRaw);
+
+				if (!productName) validationErrors.push('Product name is required for every item');
+				if (!dosageForm) validationErrors.push(`Type/category is required for "${productName || 'item'}"`);
+				if (!Number.isInteger(quantity) || quantity <= 0) validationErrors.push(`Invalid quantity for "${productName || 'item'}"`);
+				if (unitPrice != null && (!Number.isFinite(unitPrice) || unitPrice < 0)) {
+					validationErrors.push(`Invalid unit price for "${productName || 'item'}"`);
+				}
 				if (!parsedExpiry) {
-					missingExpiryRows.push(typeof reviewItem.medicineName === 'string' && reviewItem.medicineName.trim()
-						? reviewItem.medicineName.trim()
-						: receiptItem.medicineName);
+					missingExpiryRows.push(productName || receiptItem.medicineName);
 					continue;
 				}
+
 				prepared.push({
 					reviewItem,
 					receiptItem,
+					productName,
+					dosageForm,
+					quantity,
+					unitPrice,
+					genericName: typeof reviewItem.genericName === 'string' ? reviewItem.genericName.trim() : (receiptItem.genericName || ''),
+					manufacturer: typeof reviewItem.manufacturer === 'string' ? reviewItem.manufacturer.trim() : (receiptItem.manufacturer || ''),
+					strength: typeof reviewItem.strength === 'string' ? reviewItem.strength.trim() : (receiptItem.strength || ''),
 					batchNumber: normalizeBatchNumber(reviewItem.batchNumber ?? receiptItem.batchNumber),
 					expiryDate: parsedExpiry,
+					createNew: reviewItem.createNew === true,
+					totalPrice: reviewItem.totalPrice != null && Number.isFinite(Number(reviewItem.totalPrice))
+						? Number(reviewItem.totalPrice)
+						: (unitPrice != null ? Number((quantity * unitPrice).toFixed(2)) : null),
 				});
 			}
 			if (missingExpiryRows.length > 0) {
-				throw Object.assign(new Error(`Expiry date required for: ${missingExpiryRows.join(', ')}`), { statusCode: 400 });
+				throw Object.assign(
+					new Error(`Expiry date is required before stock can be added. Missing for: ${missingExpiryRows.join(', ')}`),
+					{ statusCode: 400, code: 'EXPIRY_REQUIRED' },
+				);
+			}
+			if (validationErrors.length > 0) {
+				throw Object.assign(new Error(validationErrors[0]), { statusCode: 400 });
 			}
 
 			const updated = [];
@@ -1154,29 +1368,59 @@ app.post('/api/stock/receipt/confirm', requireAdmin, requireStockSchema, async (
 			warningCutoff.setUTCDate(warningCutoff.getUTCDate() + resolvedExpiryWarningDays);
 			let expiringItemCount = 0;
 
-			for (const { reviewItem, receiptItem, batchNumber, expiryDate } of prepared) {
-				const medicines = await tx.$queryRaw(Prisma.sql`SELECT "id", "availableQty" FROM "Medicine" WHERE "id" = ${reviewItem.medicineId} FOR UPDATE`);
-				if (medicines.length === 0) throw Object.assign(new Error('One selected medicine no longer exists'), { statusCode: 400 });
-				await seedLegacyStockBatchIfNeeded(tx, reviewItem.medicineId);
-				const seeded = await tx.$queryRaw(Prisma.sql`SELECT "availableQty" FROM "Medicine" WHERE "id" = ${reviewItem.medicineId}`);
+			for (const preparedItem of prepared) {
+				const {
+					reviewItem, productName, dosageForm, quantity, unitPrice, genericName,
+					manufacturer, strength, batchNumber, expiryDate, createNew, totalPrice,
+				} = preparedItem;
+
+				let medicineId = createNew ? null : reviewItem.medicineId;
+				if (createNew) {
+					medicineId = crypto.randomUUID();
+					const sellingPrice = unitPrice != null ? unitPrice : 0;
+					await tx.$executeRaw(Prisma.sql`
+						INSERT INTO "Medicine" (
+							"id", "brandName", "genericName", "manufacturer", "strength", "dosageForm",
+							"description", "availableQty", "piece_price", "box_price", "isActive", "createdAt", "updatedAt"
+						) VALUES (
+							${medicineId}, ${productName}, ${genericName || ''}, ${manufacturer || ''}, ${strength || ''},
+							${dosageForm}, NULL, 0, ${sellingPrice}, ${sellingPrice}, true, NOW(), NOW()
+						)
+					`);
+				} else {
+					const medicines = await tx.$queryRaw(Prisma.sql`
+						SELECT "id", "availableQty", "isActive" FROM "Medicine" WHERE "id" = ${medicineId} FOR UPDATE
+					`);
+					if (medicines.length === 0) throw Object.assign(new Error('One selected medicine no longer exists'), { statusCode: 400 });
+				}
+
+				await seedLegacyStockBatchIfNeeded(tx, medicineId);
+				const seeded = await tx.$queryRaw(Prisma.sql`SELECT "availableQty" FROM "Medicine" WHERE "id" = ${medicineId}`);
 				const previousStock = Number(seeded[0].availableQty);
-				await addToStockBatch(tx, {
-					medicineId: reviewItem.medicineId,
+				const batch = await addToStockBatch(tx, {
+					medicineId,
 					batchNumber,
 					expiryDate,
-					quantityDelta: reviewItem.quantity,
+					quantityDelta: quantity,
+					purchasePrice: unitPrice,
+					sellingPrice: unitPrice,
 				});
-				const newStock = await recomputeMedicineQty(tx, reviewItem.medicineId);
+				const newStock = await recomputeMedicineQty(tx, medicineId);
 				if (newStock > 2147483647) throw Object.assign(new Error('Stock quantity is too large'), { statusCode: 400 });
-				const medicineName = typeof reviewItem.medicineName === 'string' && reviewItem.medicineName.trim()
-					? reviewItem.medicineName.trim()
-					: receiptItem.medicineName;
+
 				const expiryStored = expiryDateToStorageString(expiryDate);
 				await tx.$executeRaw(Prisma.sql`
 					UPDATE "StockReceiptItem"
-					SET "medicineName" = ${medicineName},
-						"quantity" = ${reviewItem.quantity},
-						"matchedMedicineId" = ${reviewItem.medicineId},
+					SET "medicineName" = ${productName},
+						"brandName" = ${productName},
+						"genericName" = ${genericName || null},
+						"strength" = ${strength || null},
+						"dosageForm" = ${dosageForm},
+						"manufacturer" = ${manufacturer || null},
+						"quantity" = ${quantity},
+						"unitPrice" = ${unitPrice},
+						"totalPrice" = ${totalPrice},
+						"matchedMedicineId" = ${medicineId},
 						"matchStatus" = 'MATCHED',
 						"batchNumber" = ${batchNumber},
 						"expiryDate" = ${expiryStored}
@@ -1184,31 +1428,60 @@ app.post('/api/stock/receipt/confirm', requireAdmin, requireStockSchema, async (
 				`);
 				await writeStockTransaction(tx, {
 					receiptId,
-					medicineId: reviewItem.medicineId,
-					transactionType: 'PURCHASE_RECEIPT',
-					quantity: reviewItem.quantity,
+					medicineId,
+					batchId: batch.id,
+					transactionType: 'PURCHASE',
+					quantity,
 					previousStock,
 					newStock,
 					batchNumber,
 					expiryDate,
+					reason: 'Receipt confirmation',
 					createdBy: req.adminId || 'admin',
 				});
 				if (expiryDate <= warningCutoff) expiringItemCount += 1;
 				updated.push({
-					medicineId: reviewItem.medicineId,
+					medicineId,
+					medicineName: productName,
+					created: createNew,
 					previousStock,
-					quantityAdded: reviewItem.quantity,
+					quantityAdded: quantity,
 					newStock,
+					batchId: batch.id,
 					batchNumber,
 					expiryDate: expiryStored,
 				});
 			}
+
 			const skipped = receiptItems.filter((item) => !itemIds.has(item.id)).map((item) => ({
 				id: item.id,
 				medicineName: item.medicineName,
-				reason: item.quantity === null ? 'Quantity is missing' : 'Not matched or skipped',
+				reason: 'Not included in confirmation',
 			}));
-			await tx.$executeRaw(Prisma.sql`UPDATE "StockReceipt" SET "status" = 'CONFIRMED', "confirmedBy" = ${req.adminId || 'admin'}, "confirmedAt" = NOW(), "fileData" = ${Buffer.alloc(0)} WHERE "id" = ${receiptId}`);
+
+			const supplierName = typeof receiptMeta.supplierName === 'string' ? receiptMeta.supplierName.trim() || null : undefined;
+			const invoiceNumber = typeof receiptMeta.invoiceNumber === 'string' ? receiptMeta.invoiceNumber.trim() || null : undefined;
+			const purchaseDate = typeof receiptMeta.purchaseDate === 'string' ? receiptMeta.purchaseDate.trim() || null : undefined;
+			const subtotal = receiptMeta.subtotal != null && Number.isFinite(Number(receiptMeta.subtotal)) ? Number(receiptMeta.subtotal) : undefined;
+			const discount = receiptMeta.discount != null && Number.isFinite(Number(receiptMeta.discount)) ? Number(receiptMeta.discount) : undefined;
+			const tax = receiptMeta.tax != null && Number.isFinite(Number(receiptMeta.tax)) ? Number(receiptMeta.tax) : undefined;
+			const total = receiptMeta.total != null && Number.isFinite(Number(receiptMeta.total)) ? Number(receiptMeta.total) : undefined;
+
+			await tx.$executeRaw(Prisma.sql`
+				UPDATE "StockReceipt"
+				SET "status" = 'CONFIRMED',
+					"confirmedBy" = ${req.adminId || 'admin'},
+					"confirmedAt" = NOW(),
+					"fileData" = ${Buffer.alloc(0)},
+					"supplierName" = COALESCE(${supplierName ?? null}, "supplierName"),
+					"invoiceNumber" = COALESCE(${invoiceNumber ?? null}, "invoiceNumber"),
+					"purchaseDate" = COALESCE(${purchaseDate ?? null}, "purchaseDate"),
+					"subtotal" = COALESCE(${subtotal ?? null}, "subtotal"),
+					"discount" = COALESCE(${discount ?? null}, "discount"),
+					"tax" = COALESCE(${tax ?? null}, "tax"),
+					"total" = COALESCE(${total ?? null}, "total")
+				WHERE "id" = ${receiptId}
+			`);
 			return { type: 'confirmed', updated, skipped, expiringItemCount };
 		});
 		if (result.type === 'missing') return res.status(404).json({ error: 'Receipt not found' });
@@ -1228,8 +1501,8 @@ app.post('/api/stock/receipt/confirm', requireAdmin, requireStockSchema, async (
 		}
 		res.json({ status: 'CONFIRMED', updated: result.updated, skipped: result.skipped, expiringItemCount: result.expiringItemCount });
 	} catch (error) {
-		if (error.statusCode === 400 || error.message === 'One selected medicine no longer exists' || error.message === 'Receipt item does not belong to this receipt' || error.message === 'Stock quantity is too large' || error.message?.startsWith('Expiry date required')) {
-			return res.status(400).json({ error: error.message });
+		if (error.statusCode === 400 || error.code === 'EXPIRY_REQUIRED' || error.message === 'One selected medicine no longer exists' || error.message === 'Receipt item does not belong to this receipt' || error.message === 'Stock quantity is too large' || error.message?.startsWith('Expiry date') || error.message?.includes('required')) {
+			return res.status(400).json({ error: error.message, code: error.code || 'CONFIRMATION_VALIDATION_FAILED' });
 		}
 		next(error);
 	}
@@ -1662,12 +1935,16 @@ app.get('/api/admin/receipts', requireAdmin, requireStockSchema, async (req, res
 		const status = typeof req.query.status === 'string' && req.query.status.trim() ? req.query.status.trim().toUpperCase() : null;
 		const rows = status
 			? await prisma.$queryRaw(Prisma.sql`
-				SELECT "id", "fileName", "mimeType", "fileHash", "status", "uploadedBy", "uploadedAt", "processedAt", "confirmedBy", "confirmedAt", "errorMessage"
+				SELECT "id", "fileName", "mimeType", "fileHash", "status", "uploadedBy", "uploadedAt", "processedAt",
+					"confirmedBy", "confirmedAt", "errorMessage",
+					"supplierName", "invoiceNumber", "purchaseDate", "subtotal", "discount", "tax", "total"
 				FROM "StockReceipt" WHERE "status" = ${status}
 				ORDER BY "uploadedAt" DESC LIMIT ${limit} OFFSET ${offset}
 			`)
 			: await prisma.$queryRaw(Prisma.sql`
-				SELECT "id", "fileName", "mimeType", "fileHash", "status", "uploadedBy", "uploadedAt", "processedAt", "confirmedBy", "confirmedAt", "errorMessage"
+				SELECT "id", "fileName", "mimeType", "fileHash", "status", "uploadedBy", "uploadedAt", "processedAt",
+					"confirmedBy", "confirmedAt", "errorMessage",
+					"supplierName", "invoiceNumber", "purchaseDate", "subtotal", "discount", "tax", "total"
 				FROM "StockReceipt"
 				ORDER BY "uploadedAt" DESC LIMIT ${limit} OFFSET ${offset}
 			`);
@@ -1727,58 +2004,88 @@ app.post('/api/admin/medicines', requireAdmin, requireStockSchema, async (req, r
 	const genericName = typeof req.body?.genericName === 'string' ? req.body.genericName.trim() : '';
 	const manufacturer = typeof req.body?.manufacturer === 'string' ? req.body.manufacturer.trim() : '';
 	const strength = typeof req.body?.strength === 'string' ? req.body.strength.trim() : '';
-	const singlePiecePrice = req.body?.singlePiecePrice === undefined ? 0 : Number(req.body.singlePiecePrice);
-	const fullBoxPrice = req.body?.fullBoxPrice === undefined ? 0 : Number(req.body.fullBoxPrice);
+	const dosageForm = normalizeDosageForm(req.body?.dosageForm || req.body?.type || req.body?.category) || 'Other';
+	const description = typeof req.body?.description === 'string' ? req.body.description.trim() || null : null;
+	const singlePiecePrice = req.body?.singlePiecePrice === undefined
+		? (req.body?.sellingPrice === undefined ? 0 : Number(req.body.sellingPrice))
+		: Number(req.body.singlePiecePrice);
+	const fullBoxPrice = req.body?.fullBoxPrice === undefined ? singlePiecePrice : Number(req.body.fullBoxPrice);
+	const purchasePrice = req.body?.purchasePrice === undefined || req.body?.purchasePrice === ''
+		? null
+		: Number(req.body.purchasePrice);
 	const hasInitialQty = req.body?.availableQty !== undefined && req.body?.availableQty !== null && req.body?.availableQty !== '';
 	const availableQty = hasInitialQty ? Number(req.body.availableQty) : 0;
 	const batchNumber = normalizeBatchNumber(req.body?.batchNumber);
 	const parsedExpiry = parseExpiryDate(req.body?.expiryDate);
+	const forceCreate = req.body?.forceCreate === true;
 	const reason = typeof req.body?.reason === 'string' && req.body.reason.trim()
 		? req.body.reason.trim().slice(0, 200)
 		: 'Initial stock on create';
 
-	if (!brandName || !genericName || !manufacturer || !strength) {
-		return res.status(400).json({ error: 'brandName, genericName, manufacturer, and strength are required' });
+	if (!brandName) {
+		return res.status(400).json({ error: 'Medicine/brand name is required' });
+	}
+	if (!normalizeDosageForm(dosageForm)) {
+		return res.status(400).json({ error: 'Type/category is required', allowed: DOSAGE_FORMS });
 	}
 	if (!Number.isFinite(singlePiecePrice) || singlePiecePrice < 0 || !Number.isFinite(fullBoxPrice) || fullBoxPrice < 0) {
 		return res.status(400).json({ error: 'Prices must be non-negative numbers' });
+	}
+	if (purchasePrice != null && (!Number.isFinite(purchasePrice) || purchasePrice < 0)) {
+		return res.status(400).json({ error: 'Purchase price must be a non-negative number' });
 	}
 	if (!Number.isInteger(availableQty) || availableQty < 0) {
 		return res.status(400).json({ error: 'availableQty must be a non-negative integer' });
 	}
 	if (availableQty > 0 && !parsedExpiry) {
-		return res.status(400).json({ error: 'expiryDate is required when adding initial stock' });
+		return res.status(400).json({ error: 'Expiry date is required when adding initial stock' });
 	}
 
 	try {
-		const existing = await prisma.$queryRaw(Prisma.sql`
-			SELECT "id", "brandName", "strength" FROM "Medicine"
-			WHERE "brandName" = ${brandName} AND "strength" = ${strength}
-			LIMIT 1
-		`);
-		if (existing.length > 0) {
-			return res.status(409).json({ error: 'A medicine with this brandName and strength already exists' });
+		if (!forceCreate) {
+			const similar = await findSimilarMedicines({
+				brandName,
+				genericName,
+				strength,
+				manufacturer,
+				dosageForm,
+			});
+			if (similar.length > 0) {
+				return res.status(409).json({
+					error: 'SIMILAR_MEDICINE_EXISTS',
+					message: 'Similar medicine already exists',
+					similar: similar.map((row) => mapMedicineRow(row)),
+				});
+			}
 		}
 
 		const medicine = await prisma.$transaction(async (tx) => {
 			const id = crypto.randomUUID();
 			const rows = await tx.$queryRaw(Prisma.sql`
-				INSERT INTO "Medicine" ("id", "brandName", "genericName", "manufacturer", "strength", "availableQty", "piece_price", "box_price", "createdAt", "updatedAt")
-				VALUES (${id}, ${brandName}, ${genericName}, ${manufacturer}, ${strength}, 0, ${singlePiecePrice}, ${fullBoxPrice}, NOW(), NOW())
+				INSERT INTO "Medicine" (
+					"id", "brandName", "genericName", "manufacturer", "strength", "dosageForm", "description",
+					"availableQty", "piece_price", "box_price", "isActive", "createdAt", "updatedAt"
+				) VALUES (
+					${id}, ${brandName}, ${genericName || ''}, ${manufacturer || ''}, ${strength || ''}, ${dosageForm},
+					${description}, 0, ${singlePiecePrice}, ${fullBoxPrice}, true, NOW(), NOW()
+				)
 				RETURNING *
 			`);
 			let created = rows[0];
 			if (availableQty > 0) {
-				await addToStockBatch(tx, {
+				const batch = await addToStockBatch(tx, {
 					medicineId: id,
 					batchNumber,
 					expiryDate: parsedExpiry,
 					quantityDelta: availableQty,
+					purchasePrice,
+					sellingPrice: singlePiecePrice,
 				});
 				const newStock = await recomputeMedicineQty(tx, id);
 				await writeStockTransaction(tx, {
 					medicineId: id,
-					transactionType: 'MANUAL_ADJUSTMENT',
+					batchId: batch.id,
+					transactionType: 'ADJUSTMENT',
 					quantity: availableQty,
 					previousStock: 0,
 					newStock,
@@ -1793,18 +2100,32 @@ app.post('/api/admin/medicines', requireAdmin, requireStockSchema, async (req, r
 			return created;
 		});
 
-		res.status(201).json(serializeDatabaseValue({
-			...medicine,
-			singlePiecePrice: Number(medicine.piece_price ?? 0),
-			fullBoxPrice: Number(medicine.box_price ?? 0),
-		}));
+		res.status(201).json(serializeDatabaseValue(mapMedicineRow(medicine)));
 	} catch (error) {
 		if (error.statusCode === 400) return res.status(400).json({ error: error.message });
 		next(error);
 	}
 });
 
-app.patch('/api/admin/medicines/:id', requireAdmin, async (req, res, next) => {
+app.get('/api/admin/medicines/similar', requireAdmin, requireStockSchema, async (req, res, next) => {
+	try {
+		const similar = await findSimilarMedicines({
+			brandName: req.query.brandName,
+			genericName: req.query.genericName,
+			strength: req.query.strength,
+			manufacturer: req.query.manufacturer,
+			dosageForm: req.query.dosageForm || req.query.type,
+		});
+		res.json(serializeDatabaseValue({
+			message: similar.length > 0 ? 'Similar medicine already exists' : 'No similar medicines found',
+			similar: similar.map((row) => mapMedicineRow(row)),
+		}));
+	} catch (error) {
+		next(error);
+	}
+});
+
+app.patch('/api/admin/medicines/:id', requireAdmin, requireStockSchema, async (req, res, next) => {
 	try {
 		const medicines = await prisma.$queryRaw(Prisma.sql`SELECT * FROM "Medicine" WHERE "id" = ${String(req.params.id)}`);
 		if (medicines.length === 0) return res.status(404).json({ error: 'Medicine not found' });
@@ -1813,25 +2134,48 @@ app.patch('/api/admin/medicines/:id', requireAdmin, async (req, res, next) => {
 		const genericName = typeof req.body?.genericName === 'string' ? req.body.genericName.trim() : current.genericName;
 		const manufacturer = typeof req.body?.manufacturer === 'string' ? req.body.manufacturer.trim() : current.manufacturer;
 		const strength = typeof req.body?.strength === 'string' ? req.body.strength.trim() : current.strength;
-		const singlePiecePrice = req.body?.singlePiecePrice !== undefined ? Number(req.body.singlePiecePrice) : Number(current.piece_price ?? current.singlePiecePrice ?? 0);
+		const dosageForm = normalizeDosageForm(req.body?.dosageForm || req.body?.type || req.body?.category) || current.dosageForm || 'Other';
+		const description = typeof req.body?.description === 'string'
+			? (req.body.description.trim() || null)
+			: current.description;
+		const isActive = typeof req.body?.isActive === 'boolean' ? req.body.isActive : current.isActive !== false;
+		const singlePiecePrice = req.body?.singlePiecePrice !== undefined
+			? Number(req.body.singlePiecePrice)
+			: (req.body?.sellingPrice !== undefined ? Number(req.body.sellingPrice) : Number(current.piece_price ?? current.singlePiecePrice ?? 0));
 		const fullBoxPrice = req.body?.fullBoxPrice !== undefined ? Number(req.body.fullBoxPrice) : Number(current.box_price ?? current.fullBoxPrice ?? 0);
-		if (!brandName || !genericName || !manufacturer || !strength) {
-			return res.status(400).json({ error: 'Medicine fields cannot be empty' });
+		if (!brandName) {
+			return res.status(400).json({ error: 'Medicine/brand name is required' });
+		}
+		if (!normalizeDosageForm(dosageForm)) {
+			return res.status(400).json({ error: 'Type/category is required', allowed: DOSAGE_FORMS });
 		}
 		if (!Number.isFinite(singlePiecePrice) || singlePiecePrice < 0 || !Number.isFinite(fullBoxPrice) || fullBoxPrice < 0) {
 			return res.status(400).json({ error: 'Prices must be non-negative numbers' });
 		}
 		const rows = await prisma.$queryRaw(Prisma.sql`
 			UPDATE "Medicine"
-			SET "brandName" = ${brandName}, "genericName" = ${genericName}, "manufacturer" = ${manufacturer},
-				"strength" = ${strength}, "piece_price" = ${singlePiecePrice}, "box_price" = ${fullBoxPrice}, "updatedAt" = NOW()
+			SET "brandName" = ${brandName}, "genericName" = ${genericName || ''}, "manufacturer" = ${manufacturer || ''},
+				"strength" = ${strength || ''}, "dosageForm" = ${dosageForm}, "description" = ${description},
+				"isActive" = ${isActive}, "piece_price" = ${singlePiecePrice}, "box_price" = ${fullBoxPrice}, "updatedAt" = NOW()
 			WHERE "id" = ${String(req.params.id)} RETURNING *
 		`);
-		const medicine = rows[0];
+		res.json(serializeDatabaseValue(mapMedicineRow(rows[0])));
+	} catch (error) {
+		next(error);
+	}
+});
+
+app.delete('/api/admin/medicines/:id', requireAdmin, requireStockSchema, async (req, res, next) => {
+	try {
+		const medicineId = String(req.params.id);
+		const rows = await prisma.$queryRaw(Prisma.sql`
+			UPDATE "Medicine" SET "isActive" = false, "updatedAt" = NOW()
+			WHERE "id" = ${medicineId} RETURNING *
+		`);
+		if (rows.length === 0) return res.status(404).json({ error: 'Medicine not found' });
 		res.json(serializeDatabaseValue({
-			...medicine,
-			singlePiecePrice: Number(medicine.piece_price ?? 0),
-			fullBoxPrice: Number(medicine.box_price ?? 0),
+			...mapMedicineRow(rows[0]),
+			message: 'Medicine deactivated',
 		}));
 	} catch (error) {
 		next(error);
@@ -1941,107 +2285,12 @@ app.patch('/api/admin/appointments/:id', requireAdmin, (_req, res) => {
 	res.status(410).json({ error: 'Appointments have been removed from this pharmacy.' });
 });
 
-app.post('/api/admin/medicines/sync', requireAdmin, async (_req, res, next) => {
-	const apiUrl = process.env.MEDICINE_API_URL || DEFAULT_MEDICINE_API_URL;
-
-	try {
-		const response = await fetch(apiUrl, {
-			headers: { Accept: 'text/csv, application/json;q=0.9, */*;q=0.8' },
-			signal: AbortSignal.timeout(25_000),
-		});
-		if (!response.ok) return res.status(502).json({ error: 'Medicine API request failed' });
-		const contentType = response.headers.get('content-type') || '';
-		const payload = contentType.includes('json') ? await response.json() : await response.text();
-		let records;
-		if (typeof payload === 'string') {
-			const rows = payload.split(/\r?\n/).filter((row) => row.trim());
-			const headers = parseCsvLine(rows.shift() || '').map((header) => header.toLowerCase());
-			const getColumn = (columns, names, fallback) => {
-				const index = names.map((name) => headers.indexOf(name)).find((index) => index >= 0);
-				return index === undefined ? fallback : columns[index] || fallback;
-			};
-			records = rows.map((row) => {
-				const columns = parseCsvLine(row);
-				return {
-					brandName: getColumn(columns, ['brand name', 'brand', 'name'], ''),
-					genericName: getColumn(columns, ['generic', 'generic name'], 'Generic Formula'),
-					manufacturer: getColumn(columns, ['manufacturer', 'company'], 'Bangladeshi Pharma'),
-					strength: getColumn(columns, ['strength', 'dosage'], 'Standard'),
-				};
-			});
-		} else {
-			records = Array.isArray(payload) ? payload : payload.data || payload.medicines || payload.results;
-		}
-		if (!Array.isArray(records)) return res.status(502).json({ error: 'Medicine API returned an unsupported format' });
-
-		let imported = 0;
-		let skipped = 0;
-		const prepared = [];
-		for (const item of records) {
-			const brandName = String(item.brandName || item.brand || item.name || '').trim();
-			const strength = String(item.strength || item.dosage || 'Standard').trim();
-			if (!brandName) {
-				skipped += 1;
-				continue;
-			}
-			prepared.push({
-				brandName,
-				genericName: String(item.genericName || item.generic || 'Generic Formula').trim() || 'Generic Formula',
-				manufacturer: String(item.manufacturer || item.company || 'Bangladeshi Pharma').trim() || 'Bangladeshi Pharma',
-				strength,
-			});
-		}
-
-		// One round-trip for existing keys instead of per-row SELECT.
-		const existingRows = await prisma.$queryRaw(Prisma.sql`SELECT "brandName", "strength" FROM "Medicine"`);
-		const existingKeys = new Set(existingRows.map((row) => `${row.brandName}::${row.strength}`));
-		const toInsert = [];
-		for (const item of prepared) {
-			const key = `${item.brandName}::${item.strength}`;
-			if (existingKeys.has(key)) {
-				skipped += 1;
-				continue;
-			}
-			existingKeys.add(key);
-			toInsert.push(item);
-		}
-
-		const BATCH_SIZE = 100;
-		for (let index = 0; index < toInsert.length; index += BATCH_SIZE) {
-			const batch = toInsert.slice(index, index + BATCH_SIZE);
-			const values = batch.map((item) => Prisma.sql`(
-				${crypto.randomUUID()}, ${item.brandName}, ${item.genericName}, ${item.manufacturer}, ${item.strength},
-				0, 0, 0, NOW(), NOW()
-			)`);
-			try {
-				await prisma.$executeRaw(Prisma.sql`
-					INSERT INTO "Medicine" ("id", "brandName", "genericName", "manufacturer", "strength", "availableQty", "piece_price", "box_price", "createdAt", "updatedAt")
-					VALUES ${Prisma.join(values)}
-				`);
-				imported += batch.length;
-			} catch (batchError) {
-				console.error('Batch medicine import failed, falling back to row inserts:', batchError.message);
-				for (const item of batch) {
-					try {
-						await prisma.$executeRaw(Prisma.sql`
-							INSERT INTO "Medicine" ("id", "brandName", "genericName", "manufacturer", "strength", "availableQty", "piece_price", "box_price", "createdAt", "updatedAt")
-							VALUES (${crypto.randomUUID()}, ${item.brandName}, ${item.genericName}, ${item.manufacturer}, ${item.strength}, 0, 0, 0, NOW(), NOW())
-						`);
-						imported += 1;
-					} catch (rowError) {
-						console.error(`Skipping medicine import for ${item.brandName}:`, rowError.message);
-						skipped += 1;
-					}
-				}
-			}
-		}
-		res.json({ imported, skipped, total: records.length });
-	} catch (error) {
-		if (error.name === 'TimeoutError' || error.name === 'AbortError') {
-			return res.status(504).json({ error: 'Medicine catalog sync timed out. Try again later.' });
-		}
-		next(error);
-	}
+app.post('/api/admin/medicines/sync', requireAdmin, async (_req, res) => {
+	// Catalog sync is disabled: inventory is admin-controlled after the redesign.
+	return res.status(410).json({
+		error: 'CATALOG_SYNC_DISABLED',
+		message: 'Bulk Bangladesh catalog sync is disabled. Create medicines from Admin → Add medicine or confirm a receipt.',
+	});
 });
 
 app.post('/api/chat', rateLimit('chat', 15, 60_000), async (req, res, next) => {

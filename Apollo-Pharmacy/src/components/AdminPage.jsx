@@ -1,18 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  deactivateMedicine,
   fetchMedicines,
+  getBatches,
   getDashboard,
   getExpiringStock,
   getLowStock,
   getMedicines,
   loginAdmin,
   sendExpiryAlertEmail,
-  syncMedicines,
 } from '../api'
 import DashboardStats from './DashboardStats'
 import LowStockTable from './LowStockTable'
 import ExpiringStockTable from './ExpiringStockTable'
-import MedicineFormModal from './MedicineFormModal'
+import MedicineFormModal, { DOSAGE_FORMS } from './MedicineFormModal'
 import StockAdjustPanel from './StockAdjustPanel'
 import PushOptIn from './PushOptIn'
 
@@ -65,6 +66,93 @@ function AdminLogin({ onLogin }) {
   )
 }
 
+function BatchViewer({ token, medicine, onClose, onAddStock }) {
+  const [batches, setBatches] = useState([])
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(true)
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  const soon = new Date(today)
+  soon.setDate(soon.getDate() + 90)
+
+  useEffect(() => {
+    let cancelled = false
+    getBatches(token, medicine.id)
+      .then((rows) => { if (!cancelled) setBatches(rows) })
+      .catch((loadError) => { if (!cancelled) setError(loadError.message) })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [token, medicine.id])
+
+  const statusFor = (batch) => {
+    if (!batch.expiryDate) return { label: 'No expiry', className: 'text-[#795f00]' }
+    const expiry = new Date(batch.expiryDate)
+    if (expiry < today) return { label: 'Expired', className: 'text-[#b94f49]' }
+    if (expiry <= soon) return { label: 'Expiring soon', className: 'text-[#795f00]' }
+    return { label: 'OK', className: 'text-[#17683b]' }
+  }
+
+  return (
+    <div className="fixed inset-0 z-40 grid place-items-center bg-[#172b3d]/45 p-4">
+      <div className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-3xl border border-[#d9e7f0] bg-white p-6 shadow-2xl dark:border-slate-700 dark:bg-[#172b3d]">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h2 className="text-2xl font-extrabold">{medicine.brandName}</h2>
+            <p className="text-sm text-[#607487]">
+              {[medicine.genericName, medicine.strength, medicine.dosageForm].filter(Boolean).join(' · ')}
+              {' · Sellable qty '}{medicine.availableQty}
+            </p>
+          </div>
+          <button type="button" onClick={onClose} className="rounded-lg px-2 py-1 text-sm font-bold text-[#607487]">Close</button>
+        </div>
+        {error && <p className="mt-4 rounded-xl bg-[#fff0ef] p-3 text-sm font-semibold text-[#b94f49]">{error}</p>}
+        {loading && <p className="mt-4 text-[#607487]">Loading batches…</p>}
+        {!loading && (
+          <div className="mt-4 overflow-x-auto">
+            <table className="min-w-full text-left text-sm">
+              <thead>
+                <tr className="border-b border-[#d9e7f0] text-xs uppercase tracking-wide text-[#607487]">
+                  <th className="p-2">Batch</th>
+                  <th className="p-2">Qty</th>
+                  <th className="p-2">Purchase</th>
+                  <th className="p-2">Selling</th>
+                  <th className="p-2">Expiry</th>
+                  <th className="p-2">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {batches.length === 0 && (
+                  <tr><td className="p-3 text-[#607487]" colSpan={6}>No stock batches yet.</td></tr>
+                )}
+                {batches.map((batch) => {
+                  const status = statusFor(batch)
+                  return (
+                    <tr key={batch.id} className="border-b border-[#d9e7f0]">
+                      <td className="p-2">{batch.batchNumber || '—'}</td>
+                      <td className="p-2 font-bold">{batch.quantity}</td>
+                      <td className="p-2">{batch.purchasePrice ?? '—'}</td>
+                      <td className="p-2">{batch.sellingPrice ?? '—'}</td>
+                      <td className="p-2">{batch.expiryDate ? String(batch.expiryDate).slice(0, 10) : '—'}</td>
+                      <td className={`p-2 font-bold ${status.className}`}>{status.label}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <button
+          type="button"
+          className="mt-5 w-full rounded-xl bg-[#2f80c0] px-4 py-3 font-bold text-white"
+          onClick={() => onAddStock?.(medicine)}
+        >
+          Add stock
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function AdminDashboard({ token, onLogout }) {
   const [stats, setStats] = useState(null)
   const [lowStock, setLowStock] = useState([])
@@ -73,6 +161,8 @@ function AdminDashboard({ token, onLogout }) {
   const [medicinePagination, setMedicinePagination] = useState({ page: 1, total: 0, totalPages: 1, limit: MEDICINE_PAGE_SIZE })
   const [medicineSearch, setMedicineSearch] = useState('')
   const [submittedSearch, setSubmittedSearch] = useState('')
+  const [categoryFilter, setCategoryFilter] = useState('')
+  const [stockFilter, setStockFilter] = useState('')
   const [suggestions, setSuggestions] = useState([])
   const [medicinesLoading, setMedicinesLoading] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
@@ -82,6 +172,7 @@ function AdminDashboard({ token, onLogout }) {
   const [error, setError] = useState('')
   const [medicineModal, setMedicineModal] = useState(null)
   const [adjustTarget, setAdjustTarget] = useState(null)
+  const [batchTarget, setBatchTarget] = useState(null)
   const medicineRequestId = useRef(0)
 
   const showSuccess = (text) => {
@@ -116,25 +207,32 @@ function AdminDashboard({ token, onLogout }) {
     setAlertsLoading(false)
   }, [token, onLogout])
 
-  const searchCatalog = useCallback(async (search, page = 1) => {
+  const searchCatalog = useCallback(async (search, page = 1, filters = {}) => {
     const requestId = ++medicineRequestId.current
     setMedicinesLoading(true)
     try {
-      const { items, pagination } = await fetchMedicines({ limit: MEDICINE_PAGE_SIZE, page, search })
+      const { items, pagination } = await fetchMedicines({
+        limit: MEDICINE_PAGE_SIZE,
+        page,
+        search,
+        includeInactive: true,
+        dosageForm: filters.categoryFilter ?? categoryFilter,
+        stockStatus: filters.stockFilter ?? stockFilter,
+      })
       if (requestId !== medicineRequestId.current) return
       setMedicines(items)
       setMedicinePagination(pagination)
     } finally {
       if (requestId === medicineRequestId.current) setMedicinesLoading(false)
     }
-  }, [])
+  }, [categoryFilter, stockFilter])
 
   useEffect(() => {
     let cancelled = false
     const boot = async () => {
       const [alertsResult, medicineResult] = await Promise.allSettled([
         refreshAlerts(),
-        fetchMedicines({ limit: MEDICINE_PAGE_SIZE, page: 1 }),
+        fetchMedicines({ limit: MEDICINE_PAGE_SIZE, page: 1, includeInactive: true }),
       ])
       if (cancelled) return
       if (medicineResult.status === 'fulfilled') {
@@ -161,7 +259,7 @@ function AdminDashboard({ token, onLogout }) {
     const search = medicineSearch.trim()
     if (search.length < 2 || search === submittedSearch) return undefined
     let cancelled = false
-    const timer = setTimeout(() => getMedicines({ limit: 6, search })
+    const timer = setTimeout(() => getMedicines({ limit: 6, search, includeInactive: true })
       .then((medicineData) => { if (!cancelled) setSuggestions(medicineData) })
       .catch(() => { if (!cancelled) setSuggestions([]) }), 300)
     return () => {
@@ -193,17 +291,6 @@ function AdminDashboard({ token, onLogout }) {
     }
   }
 
-  const importCatalog = async () => {
-    try {
-      const result = await syncMedicines(token)
-      await refreshAlerts()
-      await searchCatalog(submittedSearch, medicinePagination.page || 1)
-      showSuccess(`${result.imported} new medicines imported from the Bangladesh catalog.`)
-    } catch (syncError) {
-      showError(syncError.message)
-    }
-  }
-
   const emailExpiryReport = async () => {
     try {
       const result = await sendExpiryAlertEmail(token)
@@ -211,6 +298,17 @@ function AdminDashboard({ token, onLogout }) {
       else showError(result.reason === 'smtp-not-configured' ? 'SMTP is not configured on the server.' : (result.reason || 'Email was not sent.'))
     } catch (emailError) {
       showError(emailError.message)
+    }
+  }
+
+  const handleDeactivate = async (medicine) => {
+    if (!window.confirm(`Deactivate ${medicine.brandName}? It will hide from the public catalog.`)) return
+    try {
+      const updated = await deactivateMedicine(token, medicine.id)
+      setMedicines((current) => current.map((item) => (item.id === updated.id ? updated : item)))
+      showSuccess('Medicine deactivated.')
+    } catch (deactivateError) {
+      showError(deactivateError.message)
     }
   }
 
@@ -228,7 +326,7 @@ function AdminDashboard({ token, onLogout }) {
         <header className="flex flex-wrap items-center justify-between gap-4">
           <div>
             <h1 className="text-4xl font-extrabold">Pharmacy operations</h1>
-            <p className="mt-1 text-sm text-[#607487]">Admin-first stock, expiry, and receipt processing</p>
+            <p className="mt-1 text-sm text-[#607487]">Admin-controlled inventory, expiry, and receipt processing</p>
           </div>
           <nav className="flex flex-wrap gap-2">
             <a href="/" className="rounded-xl border border-[#d9e7f0] bg-white px-4 py-2 text-sm font-bold dark:border-slate-700 dark:bg-[#172b3d]">Public site</a>
@@ -251,10 +349,7 @@ function AdminDashboard({ token, onLogout }) {
             Email expiry report
           </button>
           <button type="button" onClick={() => setMedicineModal({})} className="rounded-xl border border-[#2f80c0] bg-white px-4 py-2 text-sm font-bold text-[#2f80c0]">
-            Add medicine
-          </button>
-          <button type="button" onClick={importCatalog} className="rounded-xl border border-[#d9e7f0] bg-white px-4 py-2 text-sm font-bold dark:border-slate-700 dark:bg-[#172b3d]">
-            Sync Bangladesh catalog
+            + Add medicine
           </button>
         </div>
 
@@ -289,22 +384,56 @@ function AdminDashboard({ token, onLogout }) {
         </div>
 
         <section className="mt-8 rounded-3xl border border-[#d9e7f0] bg-white p-5 dark:border-slate-700 dark:bg-[#172b3d]">
-          <h2 className="text-2xl font-extrabold">Live stock search</h2>
+          <h2 className="text-2xl font-extrabold">Medicine management</h2>
           <p className="mt-1 text-sm text-[#607487]">
-            Server-side search and pagination (25 per page). Adjust stock with reason + expiry when adding.
+            Server-side search and pagination. Public catalog shows active medicines only.
           </p>
-          <form onSubmit={searchMedicines} className="relative mt-5 flex gap-2">
+          <form onSubmit={searchMedicines} className="relative mt-5 grid gap-2 sm:grid-cols-[1fr_auto_auto_auto]">
             <label className="sr-only" htmlFor="medicine-search">Search medicines</label>
             <input
               id="medicine-search"
-              className="min-w-0 flex-1 rounded-xl border border-[#d9e7f0] bg-[#f4f9fc] px-4 py-3 text-[#172b3d] outline-none focus:ring-2 focus:ring-[#2f80c0] dark:border-slate-600 dark:bg-slate-800 dark:text-white"
+              className="min-w-0 w-full rounded-xl border border-[#d9e7f0] bg-[#f4f9fc] px-4 py-3 text-[#172b3d] outline-none focus:ring-2 focus:ring-[#2f80c0] dark:border-slate-600 dark:bg-slate-800 dark:text-white"
               value={medicineSearch}
               onChange={(event) => setMedicineSearch(event.target.value)}
               placeholder="Search brand, generic, manufacturer, or strength"
             />
+            <select
+              className="rounded-xl border border-[#d9e7f0] bg-[#f4f9fc] px-3 py-3 text-sm dark:border-slate-600 dark:bg-slate-800"
+              value={categoryFilter}
+              onChange={async (event) => {
+                const next = event.target.value
+                setCategoryFilter(next)
+                try {
+                  await searchCatalog(submittedSearch, 1, { categoryFilter: next })
+                } catch (filterError) {
+                  showError(filterError.message)
+                }
+              }}
+            >
+              <option value="">All types</option>
+              {DOSAGE_FORMS.map((form) => <option key={form} value={form}>{form}</option>)}
+            </select>
+            <select
+              className="rounded-xl border border-[#d9e7f0] bg-[#f4f9fc] px-3 py-3 text-sm dark:border-slate-600 dark:bg-slate-800"
+              value={stockFilter}
+              onChange={async (event) => {
+                const next = event.target.value
+                setStockFilter(next)
+                try {
+                  await searchCatalog(submittedSearch, 1, { stockFilter: next })
+                } catch (filterError) {
+                  showError(filterError.message)
+                }
+              }}
+            >
+              <option value="">All stock</option>
+              <option value="in_stock">In stock</option>
+              <option value="low_stock">Low stock</option>
+              <option value="out_of_stock">Out of stock</option>
+            </select>
             <button type="submit" className="rounded-xl bg-[#2f80c0] px-4 py-3 text-sm font-bold text-white hover:bg-[#18527f]">Search</button>
             {visibleSuggestions.length > 0 && (
-              <div className="absolute left-0 right-[92px] top-full z-10 mt-2 overflow-hidden rounded-xl border border-[#d9e7f0] bg-white shadow-xl dark:border-slate-600 dark:bg-[#172b3d]">
+              <div className="absolute left-0 right-0 top-full z-10 mt-2 overflow-hidden rounded-xl border border-[#d9e7f0] bg-white shadow-xl dark:border-slate-600 dark:bg-[#172b3d] sm:right-auto sm:w-[min(100%,28rem)]">
                 {visibleSuggestions.map((medicine) => (
                   <button key={medicine.id} type="button" onClick={() => selectSuggestion(medicine)} className="block w-full border-b border-[#d9e7f0] px-4 py-3 text-left last:border-0 hover:bg-[#e7f4fc] dark:border-slate-700 dark:hover:bg-slate-700">
                     <strong className="block text-sm dark:text-white">{medicine.brandName}</strong>
@@ -314,25 +443,55 @@ function AdminDashboard({ token, onLogout }) {
               </div>
             )}
           </form>
-          <div className="mt-5 max-h-[55vh] overflow-y-auto pr-2">
+
+          <div className="mt-5 overflow-x-auto">
             {medicinesLoading && <p className="rounded-xl bg-[#f4f9fc] p-4 text-[#607487] dark:bg-slate-800">Searching medicines…</p>}
             {!medicinesLoading && (
-              <div className="grid gap-3">
-                {medicines.length === 0 && <p className="rounded-xl bg-[#f4f9fc] p-4 text-[#607487] dark:bg-slate-800">No medicines found.</p>}
-                {medicines.map((medicine) => (
-                  <div key={medicine.id} className="flex flex-wrap items-end justify-between gap-3 rounded-2xl bg-[#f4f9fc] p-3 dark:bg-slate-800">
-                    <div>
-                      <strong className="block">{medicine.brandName}</strong>
-                      <span className="text-sm text-[#607487]">{medicine.genericName} · {medicine.strength}</span>
-                      <p className="mt-1 text-sm font-bold">Qty {medicine.availableQty} · Piece {medicine.singlePiecePrice} · Box {medicine.fullBoxPrice}</p>
-                    </div>
-                    <div className="flex gap-2">
-                      <button type="button" onClick={() => setMedicineModal(medicine)} className="rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-sm font-bold dark:border-slate-600 dark:bg-[#172b3d]">Edit</button>
-                      <button type="button" onClick={() => setAdjustTarget({ medicine })} className="rounded-lg bg-[#2f80c0] px-3 py-2 text-sm font-bold text-white hover:bg-[#18527f]">Adjust stock</button>
-                    </div>
-                  </div>
-                ))}
-              </div>
+              <table className="min-w-[720px] w-full text-left text-sm">
+                <thead>
+                  <tr className="border-b border-[#d9e7f0] text-xs uppercase tracking-wide text-[#607487]">
+                    <th className="p-2">Medicine</th>
+                    <th className="p-2">Type</th>
+                    <th className="p-2">Manufacturer</th>
+                    <th className="p-2">Stock</th>
+                    <th className="p-2">Price</th>
+                    <th className="p-2">Status</th>
+                    <th className="p-2">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {medicines.length === 0 && (
+                    <tr><td className="p-4 text-[#607487]" colSpan={7}>No medicines found. Add one to get started.</td></tr>
+                  )}
+                  {medicines.map((medicine) => (
+                    <tr key={medicine.id} className="border-b border-[#d9e7f0] align-top dark:border-slate-700">
+                      <td className="p-2">
+                        <strong className="block">{medicine.brandName}</strong>
+                        <span className="text-xs text-[#607487]">{[medicine.genericName, medicine.strength].filter(Boolean).join(' · ') || '—'}</span>
+                      </td>
+                      <td className="p-2">{medicine.dosageForm || medicine.type || '—'}</td>
+                      <td className="p-2">{medicine.manufacturer || '—'}</td>
+                      <td className="p-2 font-bold">{medicine.availableQty}</td>
+                      <td className="p-2">{medicine.sellingPrice ?? medicine.singlePiecePrice}</td>
+                      <td className="p-2">
+                        <span className={`rounded-lg px-2 py-1 text-xs font-bold ${medicine.isActive === false ? 'bg-[#fff0ef] text-[#b94f49]' : medicine.availableQty > 0 ? 'bg-[#d9f3e6] text-[#17683b]' : 'bg-[#fff8df] text-[#795f00]'}`}>
+                          {medicine.isActive === false ? 'Inactive' : (medicine.availableQty > 0 ? 'Active' : 'Out of stock')}
+                        </span>
+                      </td>
+                      <td className="p-2">
+                        <div className="flex flex-wrap gap-2">
+                          <button type="button" onClick={() => setBatchTarget(medicine)} className="rounded-lg border border-[#d9e7f0] bg-white px-2 py-1 text-xs font-bold">View</button>
+                          <button type="button" onClick={() => setMedicineModal(medicine)} className="rounded-lg border border-[#d9e7f0] bg-white px-2 py-1 text-xs font-bold">Edit</button>
+                          <button type="button" onClick={() => setAdjustTarget({ medicine })} className="rounded-lg bg-[#2f80c0] px-2 py-1 text-xs font-bold text-white">Add stock</button>
+                          {medicine.isActive !== false && (
+                            <button type="button" onClick={() => handleDeactivate(medicine)} className="rounded-lg border border-[#d98b86] px-2 py-1 text-xs font-bold text-[#b94f49]">Deactivate</button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             )}
           </div>
           {medicinePagination.totalPages > 1 && (
@@ -346,7 +505,7 @@ function AdminDashboard({ token, onLogout }) {
                   type="button"
                   disabled={medicinesLoading || medicinePagination.page <= 1}
                   onClick={() => searchCatalog(submittedSearch, medicinePagination.page - 1)}
-                  className="rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-sm font-bold disabled:opacity-40 dark:border-slate-600 dark:bg-[#172b3d]"
+                  className="rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-sm font-bold disabled:opacity-40"
                 >
                   Previous
                 </button>
@@ -354,7 +513,7 @@ function AdminDashboard({ token, onLogout }) {
                   type="button"
                   disabled={medicinesLoading || medicinePagination.page >= medicinePagination.totalPages}
                   onClick={() => searchCatalog(submittedSearch, medicinePagination.page + 1)}
-                  className="rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-sm font-bold disabled:opacity-40 dark:border-slate-600 dark:bg-[#172b3d]"
+                  className="rounded-lg border border-[#d9e7f0] bg-white px-3 py-2 text-sm font-bold disabled:opacity-40"
                 >
                   Next
                 </button>
@@ -376,8 +535,20 @@ function AdminDashboard({ token, onLogout }) {
             })
             await refreshAlerts()
             showSuccess(medicineModal.id
-              ? 'Medicine updated in the database.'
+              ? 'Medicine updated.'
               : `Medicine created${saved.availableQty > 0 ? ` with stock ${saved.availableQty}` : ''}.`)
+          }}
+        />
+      )}
+
+      {batchTarget && (
+        <BatchViewer
+          token={token}
+          medicine={batchTarget}
+          onClose={() => setBatchTarget(null)}
+          onAddStock={(medicine) => {
+            setBatchTarget(null)
+            setAdjustTarget({ medicine })
           }}
         />
       )}
