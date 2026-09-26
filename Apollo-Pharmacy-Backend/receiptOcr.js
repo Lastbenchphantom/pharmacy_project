@@ -84,19 +84,20 @@ const extractPdfText = async (buffer) => {
 };
 
 const ocrImageBuffer = async (buffer, timeoutMs = OCR_IMAGE_TIMEOUT_MS) => {
-	const worker = await createWorker('eng', 1, {
-		cachePath: process.env.TESS_CACHE_PATH || '/tmp',
-		logger: () => {},
-	});
+	// Timeout must cover createWorker (WASM load) as well as recognize — WASM init
+	// failures on Vercel otherwise hang until the platform hard-kills the function.
+	let worker;
 	try {
-		const text = await withTimeout(
-			worker.recognize(buffer).then(({ data }) => data?.text || ''),
-			timeoutMs,
-			'Receipt processing took too long. Please try again.',
-		);
-		return text;
+		return await withTimeout((async () => {
+			worker = await createWorker('eng', 1, {
+				cachePath: process.env.TESS_CACHE_PATH || '/tmp',
+				logger: () => {},
+			});
+			const { data } = await worker.recognize(buffer);
+			return data?.text || '';
+		})(), timeoutMs, 'Receipt processing took too long. Please try again.');
 	} finally {
-		await worker.terminate().catch(() => {});
+		if (worker) await worker.terminate().catch(() => {});
 	}
 };
 

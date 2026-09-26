@@ -7,7 +7,10 @@
       "src": "api/index.js",
       "use": "@vercel/node",
       "config": {
-        "maxDuration": 60
+        "maxDuration": 60,
+        "includeFiles": [
+          "node_modules/tesseract.js-core/**"
+        ]
       }
     }
   ],
