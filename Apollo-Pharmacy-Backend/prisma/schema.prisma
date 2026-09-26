@@ -13,12 +13,15 @@ datasource db {
 model Medicine {
 	id            String   @id @default(cuid())
 	brandName     String
-	genericName   String
-	manufacturer  String
-	strength      String
+	genericName   String   @default("")
+	manufacturer  String   @default("")
+	strength      String   @default("")
+	dosageForm    String   @default("Other")
+	description   String?
 	availableQty  Int      @default(0)
 	singlePiecePrice Float  @default(0) @map("piece_price")
 	fullBoxPrice  Float    @default(0) @map("box_price")
+	isActive      Boolean  @default(true)
 	createdAt     DateTime @default(now())
 	updatedAt     DateTime @updatedAt
 
@@ -30,7 +33,9 @@ model Medicine {
 	@@index([genericName])
 	@@index([manufacturer])
 	@@index([strength])
+	@@index([dosageForm])
 	@@index([availableQty])
+	@@index([isActive])
 }
 
 model Appointment {
@@ -62,6 +67,13 @@ model StockReceipt {
 	confirmedBy    String?
 	confirmedAt    DateTime?
 	errorMessage   String?
+	supplierName   String?
+	invoiceNumber  String?
+	purchaseDate   String?
+	subtotal       Float?
+	discount       Float?
+	tax            Float?
+	total          Float?
 
 	items          StockReceiptItem[]
 	transactions   StockTransaction[]
@@ -77,6 +89,7 @@ model StockReceiptItem {
 	genericName    String?
 	strength       String?
 	dosageForm     String?
+	manufacturer   String?
 	packSize       String?
 	quantity       Int?
 	unitPrice      Float?
@@ -98,6 +111,7 @@ model StockTransaction {
 	id             String   @id @default(cuid())
 	receiptId      String?
 	medicineId     String
+	batchId        String?
 	transactionType String
 	quantity       Int
 	previousStock  Int
@@ -114,17 +128,20 @@ model StockTransaction {
 	@@index([medicineId, createdAt])
 	@@index([receiptId])
 	@@index([transactionType, createdAt])
+	@@index([batchId])
 }
 
 model StockBatch {
-	id           String    @id @default(cuid())
-	medicineId   String
-	batchNumber  String?
-	expiryDate   DateTime?
-	quantity     Int       @default(0)
-	createdAt    DateTime  @default(now())
-	updatedAt    DateTime  @updatedAt
-	medicine     Medicine  @relation(fields: [medicineId], references: [id], onDelete: Cascade)
+	id             String    @id @default(cuid())
+	medicineId     String
+	batchNumber    String?
+	expiryDate     DateTime?
+	quantity       Int       @default(0)
+	purchasePrice  Float?
+	sellingPrice   Float?
+	createdAt      DateTime  @default(now())
+	updatedAt      DateTime  @updatedAt
+	medicine       Medicine  @relation(fields: [medicineId], references: [id], onDelete: Cascade)
 
 	@@unique([medicineId, batchNumber])
 	@@index([expiryDate])
