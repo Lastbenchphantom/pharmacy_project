@@ -9,7 +9,11 @@
       "config": {
         "maxDuration": 60,
         "includeFiles": [
-          "node_modules/tesseract.js-core/**"
+          "node_modules/tesseract.js-core/**",
+          "models/paddleocr/**",
+          "node_modules/onnxruntime-node/bin/napi-v6/linux/x64/**",
+          "node_modules/@img/sharp-linux-x64/**",
+          "node_modules/@img/sharp-libvips-linux-x64/**"
         ]
       }
     }

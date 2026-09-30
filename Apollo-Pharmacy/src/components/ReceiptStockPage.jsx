@@ -52,6 +52,11 @@ const mapReceiptRows = (items) => items.map((item) => ({
   matchedBrandName: item.matchedBrandName || '',
   matchedStrength: item.matchedStrength || '',
   currentStock: item.currentStock,
+  // What the OCR could not read on this line, so the reviewer knows why it was
+  // flagged instead of guessing from a blank field.
+  reviewReasons: Array.isArray(item.reviewReasonsList)
+    ? item.reviewReasonsList
+    : String(item.reviewReasons || '').split(' | ').map((reason) => reason.trim()).filter(Boolean),
   createNew: false,
   include: true,
 }))
@@ -171,6 +176,9 @@ export default function ReceiptStockPage() {
     total: '',
   })
   const [rows, setRows] = useState([])
+  // Recomputed from the rows rather than stored, so clearing a reason by fixing
+  // the field removes the line from the count as soon as it is re-entered.
+  const reviewItemCount = rows.filter((row) => row.reviewReasons?.length).length
   const [result, setResult] = useState(null)
   const [error, setError] = useState('')
   const [isWorking, setIsWorking] = useState(false)
@@ -654,6 +662,14 @@ export default function ReceiptStockPage() {
               <div className="rounded-xl bg-[#fff8df] p-3 text-sm font-bold text-[#795f00]">
                 Stock has NOT been updated yet. Expiry is required for every item before confirmation.
               </div>
+              {reviewItemCount > 0 ? (
+                <div className="mt-3 rounded-xl bg-amber-50 p-3 text-sm text-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+                  <strong className="font-bold">
+                    {reviewItemCount} of {rows.length} {rows.length === 1 ? 'line needs' : 'lines need'} checking
+                  </strong>
+                  {' '}The scan could not read every field. The reasons are listed on each line below.
+                </div>
+              ) : null}
               <h2 className="mt-5 text-2xl font-extrabold">Receipt information</h2>
               <p className="mt-1 text-sm text-[#607487]">{receipt.fileName}</p>
               <div className="mt-4 grid gap-3 sm:grid-cols-2">
@@ -693,6 +709,14 @@ export default function ReceiptStockPage() {
                     Include in confirmation
                   </label>
                 </div>
+                {row.reviewReasons?.length ? (
+                  <div className="mt-4 rounded-2xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200">
+                    <strong className="block font-bold">Check this line before confirming</strong>
+                    <ul className="mt-1 list-disc pl-5">
+                      {row.reviewReasons.map((reason) => <li key={reason}>{reason}</li>)}
+                    </ul>
+                  </div>
+                ) : null}
                 <div className="mt-4 grid gap-3 sm:grid-cols-2">
                   <label className="text-xs font-bold text-[#607487] sm:col-span-2">
                     Product name *

@@ -1,30 +1,36 @@
 {
-	"name": "apollo-pharmacy-backend",
-	"version": "1.0.0",
-	"private": true,
-	"main": "api/index.js",
-	"scripts": {
-		"dev": "node api/index.js",
-		"prisma:generate": "prisma generate --schema=./prisma/schema.prisma",
-		"prisma:validate": "prisma validate --schema=./prisma/schema.prisma",
-		"build": "prisma generate --schema=./prisma/schema.prisma",
-		"vercel-build": "prisma generate --schema=./prisma/schema.prisma"
-	},
-	"dependencies": {
-		"@prisma/client": "^6.0.0",
-		"cors": "^2.8.5",
-		"dotenv": "^16.4.5",
-		"express": "^4.21.2",
-		"multer": "^2.4.0",
-		"nodemailer": "^10.0.10",
-		"pdf-parse": "1.1.1",
-		"prisma": "^6.0.0",
-		"tesseract.js": "^7.0.0",
-		"web-push": "^3.6.7"
-	},
-	"allowScripts": {
-		"prisma@6.19.3": true,
-		"@prisma/client@6.19.3": true,
-		"@prisma/engines@6.19.3": true
-	}
+  "name": "apollo-pharmacy-backend",
+  "version": "1.0.0",
+  "private": true,
+  "main": "api/index.js",
+  "scripts": {
+    "dev": "node api/index.js",
+    "prisma:generate": "prisma generate --schema=./prisma/schema.prisma",
+    "prisma:validate": "prisma validate --schema=./prisma/schema.prisma",
+    "build": "prisma generate --schema=./prisma/schema.prisma",
+    "vercel-build": "prisma generate --schema=./prisma/schema.prisma",
+    "test": "node --test tests/",
+    "test:unit": "node --test tests/unit.test.js",
+    "test:ocr": "node --test tests/ocr-pipeline.test.js",
+    "debug:ocr": "node scripts/debug-ocr.js"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "multer": "^2.4.0",
+    "nodemailer": "^10.0.10",
+    "onnxruntime-node": "^1.30.0",
+    "pdf-parse": "1.1.1",
+    "prisma": "^6.0.0",
+    "sharp": "^0.35.5",
+    "tesseract.js": "^7.0.0",
+    "web-push": "^3.6.7"
+  },
+  "allowScripts": {
+    "prisma@6.19.3": true,
+    "@prisma/client@6.19.3": true,
+    "@prisma/engines@6.19.3": true
+  }
 }

@@ -335,6 +335,100 @@ const extractReceiptWithTesseract = async (file) => {
 	return { ...header, items };
 };
 
+/**
+ * Primary image OCR path: PP-OCRv5 via onnxruntime.
+ *
+ * Unlike the Tesseract path this keeps geometry, so line items come out of a
+ * recovered table rather than a flat text blob. Falls back to the flat-text
+ * parser when no column header could be found, because a receipt printed as
+ * free text is still worth reading — just not as a grid.
+ *
+ * Scanned PDFs are not rasterised here; they stay on the existing path.
+ */
+const extractReceiptWithPaddle = async (file, options = {}) => {
+	const overallStartedAt = Date.now();
+	const fileBuffer = Buffer.isBuffer(file.buffer) ? file.buffer : Buffer.from(file.buffer || []);
+	const mimeType = file.mimetype || 'unknown';
+	logOcrStep('paddle_start', overallStartedAt, { mimeType, byteLength: fileBuffer.length });
+
+	if (!fileBuffer.length) {
+		const error = new Error('Could not read this receipt. Please upload a clearer JPG or PNG.');
+		error.statusCode = 400;
+		throw error;
+	}
+	if (mimeType === 'application/pdf') {
+		const error = new Error('Scanned PDF OCR is not currently supported. Please upload the receipt as JPG or PNG.');
+		error.statusCode = 422;
+		throw error;
+	}
+
+	const { recognizeImage } = require('./ocr/paddleOcr');
+	const { buildReceiptTable } = require('./ocr/receiptTable');
+	const { extractFromTable } = require('./ocr/receiptExtract');
+	const { buildStructuredOutput } = require('./ocr/structuredOutput');
+
+	const ocr = await withTimeout(
+		recognizeImage(fileBuffer, options.preprocess),
+		options.timeoutMs || OCR_IMAGE_TIMEOUT_MS,
+		'Receipt processing took too long. Please try again.',
+	);
+	logOcrStep('paddle_ocr_done', overallStartedAt, { lines: ocr.lines.length });
+
+	const table = buildReceiptTable(ocr);
+	const fromTable = table ? extractFromTable(ocr, table) : null;
+
+	let structured;
+	let strategy;
+	if (fromTable) {
+		structured = buildStructuredOutput(fromTable);
+		strategy = 'paddle_table';
+	} else {
+		// No header row: fall back to the flat-text parser over the reading
+		// order the recogniser produced.
+		const flatText = ocr.lines.map((line) => line.text).join('\n');
+		const header = parseReceiptHeader(flatText);
+		const items = parseReceiptText(flatText);
+		structured = buildStructuredOutput({ header, items });
+		if (!structured.items.length) {
+			const error = new Error('Could not read this receipt. Please upload a clearer JPG or PNG.');
+			error.statusCode = 422;
+			throw error;
+		}
+		strategy = 'paddle_flat_text';
+	}
+
+	logOcrStep('paddle_complete', overallStartedAt, {
+		strategy,
+		itemCount: structured.items.length,
+		needsReview: structured.needs_review,
+	});
+
+	return {
+		// Legacy camelCase header fields the upload route already reads.
+		supplierName: structured.supplierName,
+		invoiceNumber: structured.invoiceNumber,
+		purchaseDate: structured.purchaseDate,
+		subtotal: structured.subtotal,
+		discount: structured.discount,
+		tax: structured.tax,
+		total: structured.total,
+		header: structured.header,
+		items: structured.items,
+		needsReview: structured.needs_review,
+		reviewReasons: structured.review_reasons,
+		summary: structured.summary,
+		strategy,
+		// Raw geometry is kept so the review screen can point at the exact spot
+		// on the receipt that needs attention.
+		ocr: {
+			width: ocr.width,
+			height: ocr.height,
+			lines: ocr.lines,
+			table: fromTable ? fromTable.table : null,
+		},
+	};
+};
+
 /** @deprecated Prefer extractReceiptWithTesseract — kept for callers that expect an items array. */
 const extractReceiptItemsWithTesseract = async (file) => {
 	const result = await extractReceiptWithTesseract(file);
@@ -342,6 +436,7 @@ const extractReceiptItemsWithTesseract = async (file) => {
 };
 
 module.exports = {
+	extractReceiptWithPaddle,
 	extractReceiptWithTesseract,
 	extractReceiptItemsWithTesseract,
 	parseReceiptText,

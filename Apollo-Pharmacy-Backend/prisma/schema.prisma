@@ -97,6 +97,8 @@ model StockReceiptItem {
 	batchNumber    String?
 	expiryDate     String?
 	confidence     Float    @default(0)
+	needsReview    Boolean  @default(false)
+	reviewReasons  String?
 	matchStatus    String   @default("UNMATCHED")
 	matchedMedicineId String?
 

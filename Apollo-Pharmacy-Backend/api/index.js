@@ -113,6 +113,10 @@ const ensureInventoryRedesignColumns = async () => {
 		await prisma.$executeRawUnsafe(`ALTER TABLE "StockReceipt" ADD COLUMN IF NOT EXISTS "tax" DOUBLE PRECISION`).catch(() => {});
 		await prisma.$executeRawUnsafe(`ALTER TABLE "StockReceipt" ADD COLUMN IF NOT EXISTS "total" DOUBLE PRECISION`).catch(() => {});
 		await prisma.$executeRawUnsafe(`ALTER TABLE "StockReceiptItem" ADD COLUMN IF NOT EXISTS "manufacturer" TEXT`).catch(() => {});
+		// Why the OCR asked a human to look at a line, kept alongside the line so
+		// the reason survives the upload and is shown on the review screen.
+		await prisma.$executeRawUnsafe(`ALTER TABLE "StockReceiptItem" ADD COLUMN IF NOT EXISTS "needsReview" BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
+		await prisma.$executeRawUnsafe(`ALTER TABLE "StockReceiptItem" ADD COLUMN IF NOT EXISTS "reviewReasons" TEXT`).catch(() => {});
 		await prisma.$executeRawUnsafe(`ALTER TABLE "StockTransaction" ADD COLUMN IF NOT EXISTS "batchId" TEXT`).catch(() => {});
 		await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "StockTransaction_batchId_idx" ON "StockTransaction"("batchId")`).catch(() => {});
 	})().catch((error) => {
@@ -173,6 +177,8 @@ const ensureStockSchema = async () => {
 					"batchNumber" TEXT,
 					"expiryDate" TEXT,
 					"confidence" DOUBLE PRECISION NOT NULL DEFAULT 0,
+					"needsReview" BOOLEAN NOT NULL DEFAULT false,
+					"reviewReasons" TEXT,
 					"matchStatus" TEXT NOT NULL DEFAULT 'UNMATCHED',
 					"matchedMedicineId" TEXT,
 					CONSTRAINT "StockReceiptItem_pkey" PRIMARY KEY ("id")
@@ -834,8 +840,34 @@ const findSimilarMedicines = async ({
 	return ranked.map((row) => row.medicine);
 };
 
+/**
+ * Extracts receipt data for upload.
+ *
+ * PaddleOCR (PP-OCRv5 via onnxruntime) is the primary engine because it keeps
+ * bounding boxes, so line items come out of a recovered table instead of a flat
+ * text blob. Tesseract stays as a fallback: it is slower and blind to geometry,
+ * but it is battle-tested and needs no model download, so it still covers a cold
+ * start or a Paddle-specific failure.
+ *
+ * Lazy-loaded so public medicine routes never pull either engine onto cold start.
+ */
 const extractReceiptData = async (file) => {
-	// Lazy-load OCR so public medicine routes do not pull tesseract.js on cold start.
+	const preferTesseract = String(process.env.RECEIPT_OCR_ENGINE || '').toLowerCase() === 'tesseract';
+	const paddleDisabled = String(process.env.PADDLE_OCR_DISABLED || '').toLowerCase() === 'true';
+
+	if (!preferTesseract && !paddleDisabled) {
+		const { extractReceiptWithPaddle } = require('../receiptOcr');
+		try {
+			return await extractReceiptWithPaddle(file);
+		} catch (paddleError) {
+			// A 4xx means the file itself is unusable, so retrying cannot help.
+			if (paddleError && paddleError.statusCode && paddleError.statusCode < 500) throw paddleError;
+			logReceiptProcessStep('paddle_failed', Date.now(), {
+				message: String(paddleError && paddleError.message ? paddleError.message : paddleError).slice(0, 200),
+			});
+		}
+	}
+
 	const { extractReceiptWithTesseract } = require('../receiptOcr');
 	return extractReceiptWithTesseract(file);
 };
@@ -894,7 +926,23 @@ const getReceiptDetails = async (receiptId) => {
 		FROM "StockReceiptItem" i LEFT JOIN "Medicine" m ON m."id" = i."matchedMedicineId"
 		WHERE i."receiptId" = ${receiptId} ORDER BY i."id"
 	`);
-	return serializeDatabaseValue({ ...receipts[0], items });
+	// Reasons are stored as one string so a single column carries them, but the
+	// review screen needs them separately to show each one against its line.
+	const detailedItems = items.map((item) => ({
+		...item,
+		needsReview: item.needsReview === true,
+		reviewReasonsList: String(item.reviewReasons || '')
+			.split(' | ')
+			.map((reason) => reason.trim())
+			.filter(Boolean),
+	}));
+	const reviewItemCount = detailedItems.filter((item) => item.needsReview).length;
+	return serializeDatabaseValue({
+		...receipts[0],
+		items: detailedItems,
+		needsReview: reviewItemCount > 0,
+		reviewItemCount,
+	});
 };
 
 app.get('/api/health', (_req, res) => {
@@ -1139,25 +1187,38 @@ const runReceiptProcessing = async (receiptId, { allowReadyPassthrough = true } 
 			await tx.$executeRaw(Prisma.sql`DELETE FROM "StockReceiptItem" WHERE "receiptId" = ${receiptId}`);
 			for (const extractedItem of extractedItems) {
 				const quantity = Number.isInteger(extractedItem.quantity) && extractedItem.quantity >= 0 ? extractedItem.quantity : null;
-				const confidence = Number.isFinite(Number(extractedItem.confidence)) ? Math.min(Math.max(Number(extractedItem.confidence), 0), 1) : 0;
+				const confidence = Number.isFinite(Number(extractedItem.confidence)) ? Math.min(Math.max(Number(extractedItem.confidence), 0), 1) : null;
 				const productName = String(
-					extractedItem.productName || extractedItem.medicine_name || 'Unidentified item',
+					extractedItem.productName || extractedItem.medicine_name || '',
 				).trim();
 				const dosageForm = normalizeDosageForm(extractedItem.type || extractedItem.dosage_form);
+				// "Unidentified item" used to be written as a placeholder name,
+				// which then looked like real data to the catalog matcher. An
+				// unreadable name stays empty and the line is held for review.
+				const reviewReasons = Array.isArray(extractedItem.review_reasons)
+					? extractedItem.review_reasons.filter((reason) => typeof reason === 'string' && reason.trim())
+					: [];
+				if (!productName && !reviewReasons.some((reason) => /product name/i.test(reason))) {
+					reviewReasons.push('Product name is missing or unreadable');
+				}
+				const needsReview = extractedItem.needs_review === true
+					|| extractedItem.needsReview === true
+					|| reviewReasons.length > 0;
 				await tx.$executeRaw(Prisma.sql`
 					INSERT INTO "StockReceiptItem" (
 						"id", "receiptId", "medicineName", "brandName", "genericName", "strength", "dosageForm",
 						"manufacturer", "packSize", "quantity", "unitPrice", "totalPrice", "batchNumber", "expiryDate",
-						"confidence", "matchStatus", "matchedMedicineId"
+						"confidence", "needsReview", "reviewReasons", "matchStatus", "matchedMedicineId"
 					) VALUES (
-						${crypto.randomUUID()}, ${receiptId}, ${productName},
+						${crypto.randomUUID()}, ${receiptId}, ${productName || null},
 						${extractedItem.brand_name || null}, ${extractedItem.generic_name || null},
 						${extractedItem.strength || null}, ${dosageForm}, ${extractedItem.manufacturer || null},
 						${extractedItem.pack_size || null}, ${quantity},
 						${Number.isFinite(Number(extractedItem.unit_price)) ? Number(extractedItem.unit_price) : null},
 						${Number.isFinite(Number(extractedItem.total_price)) ? Number(extractedItem.total_price) : null},
 						${extractedItem.batch_number || null}, ${extractedItem.expiry_date || null},
-						${confidence}, 'UNMATCHED', NULL
+						${confidence ?? 0}, ${needsReview}, ${reviewReasons.length ? reviewReasons.join(' | ') : null},
+						'UNMATCHED', NULL
 					)
 				`);
 			}
